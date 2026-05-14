@@ -2,6 +2,7 @@
   (:require [ducktape.ffi :as ffi]
             [tech.v3.datatype.native-buffer :as native-buffer]
             [tech.v3.datatype :as dt]
+            [tech.v3.datatype.protocols :as dt-proto]
             [tech.v3.datatype.packing :as packing]
             [tech.v3.datatype.bitmap :as bitmap]
             [tech.v3.dataset :as ds]
@@ -260,31 +261,39 @@
 
 (defn- write-string!
   [^Arena arena ^MemorySegment data-ptr subcol ^long row-count]
-  (let [base-addr (.address data-ptr)]
+  ;; Phase 1: encode all strings to byte arrays + compute total pointer-string bytes
+  (let [^objects encoded (object-array row-count)
+        total-ptr-bytes (loop [i 0 acc 0]
+                          (if (< i row-count)
+                            (let [v (subcol i)
+                                  ^bytes b (.getBytes (if (string? v) ^String v (str v)) "UTF-8")]
+                              (aset encoded i b)
+                              (recur (unchecked-inc i)
+                                     (if (> (alength b) 12) (+ acc (alength b)) acc)))
+                            acc))
+        ;; Phase 2: allocate one slab for all pointer-string data
+        ^MemorySegment slab (when (pos? total-ptr-bytes)
+                              (.allocate arena (long total-ptr-bytes)))
+        slab-offset (java.util.concurrent.atomic.AtomicLong. 0)
+        base-addr (.address data-ptr)]
+    ;; Phase 3: parallel write duckdb_string_t entries
     (dorun
      (hamf/pgroups row-count
                    (fn [^long sidx ^long eidx]
                      (let [^MemorySegment dseg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
                                                              (* (- eidx sidx) 16))]
                        (dotimes [i (- eidx sidx)]
-                         (let [sval (str (subcol (+ sidx i)))
-                               ^bytes sbytes (.getBytes sval "UTF-8")
+                         (let [^bytes sbytes (aget encoded (int (+ sidx i)))
                                slen (alength sbytes)
                                off (long (* i 16))]
                            (.set dseg ffi/VL-INT off (int slen))
                            (if (<= slen 12)
                              (MemorySegment/copy sbytes 0 dseg ffi/VL-BYTE (+ off 4) slen)
-                 ;; Pointer strings: lock arena for thread-safe alloc
-                             (let [^MemorySegment buf (locking arena (.allocate arena (long slen)))]
+                             ;; Bump-allocate from slab (lock-free via AtomicLong)
+                             (let [slab-off (.getAndAdd slab-offset (long slen))
+                                   ^MemorySegment buf (.asSlice slab slab-off (long slen))]
                                (MemorySegment/copy sbytes 0 buf ffi/VL-BYTE 0 slen)
                                (.set dseg ffi/VL-LONG (+ off 8) (.address buf))))))))))))
-
-(def ^:private ^{:tag 'java.util.Map} layout-for-width
-  "byte-width → ValueLayout for MemorySegment/copy bulk transfer."
-  {1 ffi/VL-BYTE
-   2 ffi/VL-SHORT
-   4 ffi/VL-INT
-   8 ffi/VL-LONG})
 
 (defn- write-column!
   "Write `subcol` data into DuckDB vector memory at `data-ptr`."
@@ -329,31 +338,59 @@
            _          (dotimes [ci n-cols]
                         (.set types-seg ffi/VL-ADDR (long (* ci 8))
                               ^MemorySegment (ffi/duckdb_create_logical_type (int (duckdb-ids ci)))))
-           ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))]
+           ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
+           ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
+           vecs  (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %)) (range n-cols)))
+           ;; Pre-pack temporal columns once (not per-chunk)
+           prepped-cols (object-array
+                         (map-indexed
+                          (fn [ci col]
+                            (let [dt (dtypes ci)]
+                              (if (#{:local-date :local-time :instant} dt)
+                                (packing/pack col)
+                                col)))
+                          colvec))
+           ;; Pre-resolve full-column missing bitmaps (avoid per-chunk ds/missing)
+           ^objects full-missings (object-array (map ds/missing colvec))]
        (try
          (dotimes [chunk-idx n-chunks]
            (let [row-off   (long (* chunk-idx chunk-size))
                  row-count (long (min chunk-size (- n-rows row-off)))]
              (ffi/duckdb_data_chunk_set_size write-chunk row-count)
              (dotimes [col-idx n-cols]
-               (let [^MemorySegment dvec (ffi/duckdb_data_chunk_get_vector write-chunk (long col-idx))
+               (let [^MemorySegment dvec (aget vecs col-idx)
                      _                   (ffi/duckdb_vector_ensure_validity_writable dvec)
                      ^MemorySegment dp   (ffi/duckdb_vector_get_data dvec)
                      ^MemorySegment vp   (ffi/duckdb_vector_get_validity dvec)
-                     subcol              (dt/sub-buffer (colvec col-idx) row-off row-count)]
+                     col-dt  (dtypes col-idx)
+                     ;; Clip full-column missing bitmap to this chunk's range
+                     ^RoaringBitmap full-missing (aget full-missings col-idx)
+                     chunk-missing (if (.isEmpty full-missing)
+                                     full-missing
+                                     (let [bm (RoaringBitmap/bitmapOfRange row-off (+ row-off row-count))]
+                                       (.and bm full-missing)
+                                       ;; Shift to 0-based for this chunk
+                                       (RoaringBitmap/addOffset bm (- row-off))))
+                     subcol  (dt/sub-buffer (aget prepped-cols col-idx) row-off row-count)]
                  (write-validity! (.reinterpret vp (* (long (Math/ceil (/ (double row-count) 64))) 8))
-                                  (ds/missing subcol)
+                                  chunk-missing
                                   row-count)
-                 (write-column! arena dp subcol row-count (dtypes col-idx) (.address dp))))
+                 (write-column! arena dp subcol row-count
+                                ;; Use the pre-packed dtype for temporal cols
+                                (if (#{:local-date :local-time :instant} col-dt)
+                                  (keyword (str "packed-" (name col-dt)))
+                                  col-dt)
+                                (.address dp))))
              (check-error (ffi/duckdb_append_data_chunk appender write-chunk))
              (ffi/duckdb_data_chunk_reset write-chunk)))
          n-rows
          (finally
-           (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
-           (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk write-chunk)
-           (dotimes [ci n-cols]
-             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type
-                               (.get types-seg ffi/VL-ADDR (long (* ci 8))))))))))
+           (ffi/destroy-ptrs!
+            (concat [[ffi/duckdb_appender_destroy appender]
+                     [ffi/duckdb_destroy_data_chunk write-chunk]]
+                    (map (fn [ci] [ffi/duckdb_destroy_logical_type
+                                   (.get types-seg ffi/VL-ADDR (long (* ci 8)))])
+                         (range n-cols)))))))))
   ([conn dataset] (insert-dataset! conn dataset nil)))
 
 ;; ---------------------------------------------------------------------------
@@ -370,10 +407,13 @@
       (dotimes [idx nvals]
         (let [lval (.get seg ffi/VL-LONG (long (* idx 8)))]
           (when-not (== lval -1)
-            (let [logical-idx (* idx 64)]
-              (dotimes [bit-idx 64]
-                (when (== 0 (bit-and lval (bit-shift-left 1 bit-idx)))
-                  (.add rval (unchecked-int (+ bit-idx logical-idx)))))))))
+            (let [logical-idx (unchecked-long (* idx 64))]
+              ;; Iterate only set bits in the inverted mask (O(nulls) not O(64))
+              (loop [inv (bit-not lval)]
+                (when-not (== 0 inv)
+                  (let [bit-idx (Long/numberOfTrailingZeros inv)]
+                    (.add rval (unchecked-int (+ bit-idx logical-idx)))
+                    (recur (bit-and inv (unchecked-dec inv))))))))))
       rval)))
 
 (def ^:private numeric-col-specs
@@ -398,7 +438,7 @@
   [^RoaringBitmap missing ^long n-rows ^long duckdb-type ^long data-ptr]
   (let [type-kw (get ffi/duckdb-type-map duckdb-type)]
     (if-let [[^long byte-width dtype] (get numeric-col-specs type-kw)]
-      ;; Numeric / temporal — uniform wrap-address path
+      ;; Numeric / temporal — zero-copy wrap, dt/clone does memcpy
       (let [buf (-> (native-buffer/wrap-address data-ptr (* byte-width n-rows) nil)
                     (native-buffer/set-native-datatype dtype))]
         (if (= type-kw :DUCKDB_TYPE_BOOLEAN) (dt/elemwise-cast buf :boolean) buf))
@@ -406,37 +446,53 @@
       ;; Complex types
       (case type-kw
         :DUCKDB_TYPE_UUID
-        (let [seg (-> (MemorySegment/ofAddress data-ptr)
-                      (.reinterpret (* 16 n-rows)))]
-          (reify ObjectReader
+        (let [base-addr data-ptr]
+          (reify
+            ObjectReader
             (elemwiseDatatype [_] :uuid)
             (lsize [_] n-rows)
             (readObject [_ idx]
-              (let [off (long (* idx 16))
-                    low (.get seg ffi/VL-LONG off)
-                    high (.get seg ffi/VL-LONG (+ off 8))]
-                (UUID. high low)))))
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* idx 16))) 16)
+                    low (.get seg ffi/VL-LONG (long 0))
+                    high (.get seg ffi/VL-LONG (long 8))]
+                (UUID. high low)))
+            dt-proto/PClone
+            (clone [_]
+              ;; Parallel UUID decode
+              (let [^objects out (make-array UUID n-rows)]
+                (dorun
+                 (hamf/pgroups n-rows
+                               (fn [^long sidx ^long eidx]
+                                 (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
+                                                                        (* (- eidx sidx) 16))]
+                                   (dotimes [i (- eidx sidx)]
+                                     (let [off (long (* i 16))]
+                                       (aset out (int (+ sidx i))
+                                             (UUID. (.get seg ffi/VL-LONG (+ off 8))
+                                                    (.get seg ffi/VL-LONG off)))))))))
+                (hamf/wrap-array out)))))
 
         :DUCKDB_TYPE_VARCHAR
-        ;; Return a string ObjectReader that will be bulk-decoded in parallel on clone
-        (let [base-addr data-ptr]
+        ;; Single reinterpreted segment for the whole string_t array — avoid per-element ofAddress
+        (let [base-addr data-ptr
+              ^MemorySegment full-seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 n-rows))]
           (reify
             ObjectReader
             (elemwiseDatatype [_] :string)
             (lsize [_] n-rows)
             (readObject [_ idx]
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* idx 16))) 16)
-                    slen (int (.get seg ffi/VL-INT (long 0)))]
+              (let [off (long (* idx 16))
+                    slen (int (.get full-seg ffi/VL-INT off))]
                 (if (<= slen 12)
                   (let [arr (byte-array slen)]
-                    (MemorySegment/copy seg ffi/VL-BYTE (long 4) arr 0 slen)
+                    (MemorySegment/copy full-seg ffi/VL-BYTE (+ off 4) arr 0 slen)
                     (String. arr "UTF-8"))
-                  (let [ptr-addr (.get seg ffi/VL-LONG (long 8))
+                  (let [ptr-addr (.get full-seg ffi/VL-LONG (+ off 8))
                         ^MemorySegment ptr-seg (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
                         arr (byte-array slen)]
                     (MemorySegment/copy ptr-seg ffi/VL-BYTE (long 0) arr 0 slen)
                     (String. arr "UTF-8")))))
-            tech.v3.datatype.protocols/PClone
+            dt-proto/PClone
             (clone [this]
               ;; Parallel decode via hamf/pgroups — each group works on a sub-range
               (let [ne (long n-rows)

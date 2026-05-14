@@ -12,5 +12,5 @@
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
          :main-opts ["-m" "cognitect.test-runner"]}
   :dev {:extra-deps  {com.taoensso/telemere {:mvn/version "1.2.1"}}
-        :extra-paths ["test"]
+        :extra-paths ["test" "dev"]
         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}

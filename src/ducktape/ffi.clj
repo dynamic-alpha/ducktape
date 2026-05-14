@@ -63,6 +63,23 @@
 (defn mh-invoke [^MethodHandle mh & args]
   (.invokeWithArguments mh ^java.util.List (java.util.Arrays/asList (object-array args))))
 
+;; Specialized arities — avoid varargs object-array + Arrays.asList allocation
+(let [^java.util.List e (java.util.Collections/emptyList)]
+  (defn mh-invoke0 [^MethodHandle mh]
+    (.invokeWithArguments mh e)))
+
+(defn mh-invoke1 [^MethodHandle mh a0]
+  (.invokeWithArguments mh ^java.util.List (java.util.List/of a0)))
+
+(defn mh-invoke2 [^MethodHandle mh a0 a1]
+  (.invokeWithArguments mh ^java.util.List (java.util.List/of a0 a1)))
+
+(defn mh-invoke3 [^MethodHandle mh a0 a1 a2]
+  (.invokeWithArguments mh ^java.util.List (java.util.List/of a0 a1 a2)))
+
+(defn mh-invoke4 [^MethodHandle mh a0 a1 a2 a3]
+  (.invokeWithArguments mh ^java.util.List (java.util.List/of a0 a1 a2 a3)))
+
 ;; ---------------------------------------------------------------------------
 ;; DuckDB type enum + reverse map  (data-driven, macro-generated)
 ;; ---------------------------------------------------------------------------
@@ -141,7 +158,14 @@
                       (let [fname  (symbol cname)
                             aname  (symbol (str "-" cname))
                             params (mapv #(symbol (str "a" %)) (range (count args)))
-                            call   `(mh-invoke (deref ~aname) ~@params)]
+                            invoke (case (count args)
+                                     0 'mh-invoke0
+                                     1 'mh-invoke1
+                                     2 'mh-invoke2
+                                     3 'mh-invoke3
+                                     4 'mh-invoke4
+                                     'mh-invoke)
+                            call   `(~invoke (deref ~aname) ~@params)]
                         `(defn ~fname ~params
                            ~(case coerce
                               :int  `(int ~call)
@@ -248,7 +272,12 @@
 (defn read-c-str ^String [^MemorySegment ptr]
   (when (and ptr (not= 0 (.address ptr)))
     (let [^MemorySegment seg (.reinterpret ptr Long/MAX_VALUE)]
-      (.getString seg (long 0)))))
+      (loop [n (long 0)]
+        (if (== 0 (.get seg VL-BYTE n))
+          (let [arr (byte-array n)]
+            (MemorySegment/copy seg VL-BYTE (long 0) arr 0 (int n))
+            (String. arr "UTF-8"))
+          (recur (unchecked-inc n)))))))
 
 (defn destroy-ptr!
   "Allocate a pointer-to-pointer, store `seg`'s address, call `destroy-fn` on it.
@@ -258,3 +287,13 @@
     (let [p (.allocate a VL-ADDR)]
       (.set p VL-ADDR 0 seg)
       (destroy-fn p))))
+
+(defn destroy-ptrs!
+  "Batch destroy: one arena for multiple pointer-to-pointer destroy calls.
+  `pairs` is a sequence of [destroy-fn segment]."
+  [pairs]
+  (with-open [a (Arena/ofConfined)]
+    (doseq [[destroy-fn ^MemorySegment seg] pairs]
+      (let [p (.allocate a VL-ADDR)]
+        (.set p VL-ADDR 0 seg)
+        (destroy-fn p)))))
