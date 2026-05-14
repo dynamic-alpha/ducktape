@@ -11,14 +11,12 @@
   (:import [java.util UUID]
            [java.time LocalTime]))
 
-
 (duck/initialize!)
 
 (def db* (delay (duck/initialize!)
                 (duck/open-db)))
 
 (def conn* (delay (duck/connect @db*)))
-
 
 (deftest trivial
   (try
@@ -29,8 +27,7 @@
     (duck/create-table! @conn* ds)
     (duck/insert-dataset! @conn* ds)
     (is (= 1 (-> (duck/sql->dataset @conn* "select * from trivial;")
-                  (ds/row-count))))))
-
+                 (ds/row-count))))))
 
 (defn supported-datatype-ds
   []
@@ -50,7 +47,6 @@
                  :primary-key :longs
                  :name :testtable)))
 
-
 (deftest basic-datatype-test
   (try
     (let [ds (supported-datatype-ds)]
@@ -65,12 +61,10 @@
       (try (duck/drop-table! @conn* "testtable")
            (catch Throwable _e nil)))))
 
-
 (defonce stocks-src* (delay
                        (ds/->dataset "https://github.com/techascent/tech.ml.dataset/raw/master/test/data/stocks.csv"
                                      {:key-fn keyword
                                       :dataset-name :stocks})))
-
 
 (deftest basic-stocks-test
   (try
@@ -90,7 +84,6 @@
       (try
         (duck/drop-table! @conn* "stocks")
         (catch Throwable _e nil)))))
-
 
 (deftest filter-stonks-test
   (let [stonks (-> (apply ds/concat (repeat 10 @stocks-src*))
@@ -118,7 +111,6 @@
           (duck/drop-table! @conn* stonks)
           (catch Throwable _e nil))))))
 
-
 (deftest prepared-statements-test
   (try
     (let [stocks @stocks-src*
@@ -139,7 +131,6 @@
         (duck/drop-table! @conn* "stocks")
         (catch Throwable _e nil)))))
 
-
 (deftest missing-instant-test
   (try
     (let [ds (-> (ds/->dataset {:a [1 2 nil 4 nil 6]
@@ -159,12 +150,11 @@
         (duck/drop-table! @conn* "testdb")
         (catch Throwable _e nil)))))
 
-
 (deftest insert-test
   (let [cn 4
         rn 1024
         ds-fn #(-> (into {} (for [i (range cn)] [(str "c" i)
-                                                  (for [_ (range rn)] (str (random-uuid)))]))
+                                                 (for [_ (range rn)] (str (random-uuid)))]))
                    (ds/->dataset {:dataset-name "t"})
                    (ds/select-columns (for [i (range cn)] (str "c" i))))]
     (try
@@ -174,14 +164,13 @@
     (duck/insert-dataset! @conn* (ds-fn))
     (duck/insert-dataset! @conn* (ds-fn))
     (is (= (* 2 rn) (-> (duck/sql->dataset @conn* "from t")
-                         (ds/row-count))))))
-
+                        (ds/row-count))))))
 
 (deftest insert-chunk-size-test
   (let [cn 4
         rn (ffi/duckdb_vector_size)
         ds-fn #(-> (into {} (for [i (range cn)] [(str "c" i)
-                                                  (for [_ (range rn)] (random-uuid))]))
+                                                 (for [_ (range rn)] (random-uuid))]))
                    (ds/->dataset {:dataset-name "t"})
                    (ds/select-columns (for [i (range cn)] (str "c" i))))]
     (try
@@ -191,4 +180,4 @@
     (duck/insert-dataset! @conn* (ds-fn))
     (duck/insert-dataset! @conn* (ds-fn))
     (is (= (* 2 rn) (-> (duck/sql->dataset @conn* "from t")
-                         (ds/row-count))))))
+                        (ds/row-count))))))
