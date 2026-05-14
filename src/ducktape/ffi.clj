@@ -247,7 +247,8 @@
 
 (defn read-c-str ^String [^MemorySegment ptr]
   (when (and ptr (not= 0 (.address ptr)))
-    (.getString (.reinterpret ptr Long/MAX_VALUE) 0)))
+    (let [^MemorySegment seg (.reinterpret ptr Long/MAX_VALUE)]
+      (.getString seg (long 0)))))
 
 (defn destroy-ptr!
   "Allocate a pointer-to-pointer, store `seg`'s address, call `destroy-fn` on it.
