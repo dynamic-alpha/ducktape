@@ -1,0 +1,8 @@
+{
+	"mcpServers": {
+		"clojack": {
+			"command": "clojure",
+			"args": ["-M:clojack"]
+		}
+	}
+}
