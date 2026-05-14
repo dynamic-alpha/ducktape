@@ -11,7 +11,7 @@
 (set! *warn-on-reflection* true)
 
 ;; ---------------------------------------------------------------------------
-;; 1. Typed ValueLayout constants — CRITICAL for avoiding reflection on .set/.get
+;; Typed ValueLayout constants — critical for avoiding reflection on .set/.get
 ;; ---------------------------------------------------------------------------
 
 (def ^ValueLayout$OfLong   VL-LONG   ValueLayout/JAVA_LONG)
@@ -23,7 +23,7 @@
 (def ^AddressLayout        VL-ADDR   ValueLayout/ADDRESS)
 
 ;; ---------------------------------------------------------------------------
-;; 2. Library loading
+;; Library loading
 ;; ---------------------------------------------------------------------------
 
 (def ^:private ^SymbolLookup the-lib nil)
@@ -37,7 +37,7 @@
     (SymbolLookup/libraryLookup path (Arena/global))))
 
 (defn- sym ^MemorySegment [^String name]
-      (let [opt (.find the-lib name)]
+  (let [opt (.find the-lib name)]
     (when-not (.isPresent opt)
       (throw (RuntimeException. (str "Symbol not found: " name))))
     (.get opt)))
@@ -49,464 +49,192 @@
                    (into-array Linker$Option [])))
 
 ;; ---------------------------------------------------------------------------
-;; 3. duckdb_result struct layout — 6 × JAVA_LONG (48 bytes on 64-bit)
+;; duckdb_result struct layout — 6 × JAVA_LONG (48 bytes on 64-bit)
 ;; ---------------------------------------------------------------------------
 
 (def result-layout
   (MemoryLayout/structLayout
-    (into-array MemoryLayout (repeatedly 6 (constantly ValueLayout/JAVA_LONG)))))
+   (into-array MemoryLayout (repeatedly 6 (constantly ValueLayout/JAVA_LONG)))))
 
 ;; ---------------------------------------------------------------------------
-;; 4. MethodHandle invocation helper
+;; MethodHandle invocation helper
 ;; ---------------------------------------------------------------------------
 
 (defn mh-invoke [^MethodHandle mh & args]
   (.invokeWithArguments mh ^java.util.List (java.util.Arrays/asList (object-array args))))
 
 ;; ---------------------------------------------------------------------------
-;; 5. DuckDB type enum constants
+;; DuckDB type enum + reverse map  (data-driven, macro-generated)
 ;; ---------------------------------------------------------------------------
 
-(def ^:const DUCKDB_TYPE_INVALID    0)
-(def ^:const DUCKDB_TYPE_BOOLEAN    1)
-(def ^:const DUCKDB_TYPE_TINYINT    2)
-(def ^:const DUCKDB_TYPE_SMALLINT   3)
-(def ^:const DUCKDB_TYPE_INTEGER    4)
-(def ^:const DUCKDB_TYPE_BIGINT     5)
-(def ^:const DUCKDB_TYPE_UTINYINT   6)
-(def ^:const DUCKDB_TYPE_USMALLINT  7)
-(def ^:const DUCKDB_TYPE_UINTEGER   8)
-(def ^:const DUCKDB_TYPE_UBIGINT    9)
-(def ^:const DUCKDB_TYPE_FLOAT     10)
-(def ^:const DUCKDB_TYPE_DOUBLE    11)
-(def ^:const DUCKDB_TYPE_TIMESTAMP 12)
-(def ^:const DUCKDB_TYPE_DATE      13)
-(def ^:const DUCKDB_TYPE_TIME      14)
-(def ^:const DUCKDB_TYPE_HUGEINT   16)
-(def ^:const DUCKDB_TYPE_VARCHAR   17)
-(def ^:const DUCKDB_TYPE_UUID      27)
-(def ^:const DuckDBSuccess          0)
+(def ^:private duckdb-types
+  '{DUCKDB_TYPE_INVALID    0
+    DUCKDB_TYPE_BOOLEAN    1
+    DUCKDB_TYPE_TINYINT    2
+    DUCKDB_TYPE_SMALLINT   3
+    DUCKDB_TYPE_INTEGER    4
+    DUCKDB_TYPE_BIGINT     5
+    DUCKDB_TYPE_UTINYINT   6
+    DUCKDB_TYPE_USMALLINT  7
+    DUCKDB_TYPE_UINTEGER   8
+    DUCKDB_TYPE_UBIGINT    9
+    DUCKDB_TYPE_FLOAT     10
+    DUCKDB_TYPE_DOUBLE    11
+    DUCKDB_TYPE_TIMESTAMP 12
+    DUCKDB_TYPE_DATE      13
+    DUCKDB_TYPE_TIME      14
+    DUCKDB_TYPE_HUGEINT   16
+    DUCKDB_TYPE_VARCHAR   17
+    DUCKDB_TYPE_UUID      27})
 
-(def duckdb-type-map
-  {0  :DUCKDB_TYPE_INVALID
-   1  :DUCKDB_TYPE_BOOLEAN
-   2  :DUCKDB_TYPE_TINYINT
-   3  :DUCKDB_TYPE_SMALLINT
-   4  :DUCKDB_TYPE_INTEGER
-   5  :DUCKDB_TYPE_BIGINT
-   6  :DUCKDB_TYPE_UTINYINT
-   7  :DUCKDB_TYPE_USMALLINT
-   8  :DUCKDB_TYPE_UINTEGER
-   9  :DUCKDB_TYPE_UBIGINT
-   10 :DUCKDB_TYPE_FLOAT
-   11 :DUCKDB_TYPE_DOUBLE
-   12 :DUCKDB_TYPE_TIMESTAMP
-   13 :DUCKDB_TYPE_DATE
-   14 :DUCKDB_TYPE_TIME
-   16 :DUCKDB_TYPE_HUGEINT
-   17 :DUCKDB_TYPE_VARCHAR
-   27 :DUCKDB_TYPE_UUID})
+(defmacro ^:private define-type-constants! []
+  `(do ~@(for [[sym val] duckdb-types]
+           `(def ~(with-meta sym {:const true}) ~val))
+       (def ~'duckdb-type-map
+         ~(into {} (map (fn [[sym val]] [val (keyword sym)]) duckdb-types)))))
+
+(define-type-constants!)
+
+(def ^:const DuckDBSuccess 0)
 
 ;; ---------------------------------------------------------------------------
-;; 6. All function handle atoms
+;; FFI function specs — the single source of truth
+;;
+;; Each entry: [c-name ret arg-layouts coerce]
+;;   ret       — a MemoryLayout, or :void
+;;   arg-layouts — vector of MemoryLayout expressions
+;;   coerce    — nil (raw return), `int`, or `long`
 ;; ---------------------------------------------------------------------------
 
-;; Database lifecycle
-(defonce ^:private -duckdb_open_ext (atom nil))
-(defonce ^:private -duckdb_close (atom nil))
-(defonce ^:private -duckdb_connect (atom nil))
-(defonce ^:private -duckdb_disconnect (atom nil))
-(defonce ^:private -duckdb_library_version (atom nil))
-(defonce ^:private -duckdb_free (atom nil))
+(def ^:private layout-alias
+  {:addr   'VL-ADDR
+   :int    'ValueLayout/JAVA_INT
+   :long   'ValueLayout/JAVA_LONG
+   :byte   'ValueLayout/JAVA_BYTE
+   :short  'ValueLayout/JAVA_SHORT
+   :float  'ValueLayout/JAVA_FLOAT
+   :double 'ValueLayout/JAVA_DOUBLE
+   :result 'result-layout})
 
-;; Config
-(defonce ^:private -duckdb_config_count (atom nil))
-(defonce ^:private -duckdb_create_config (atom nil))
-(defonce ^:private -duckdb_get_config_flag (atom nil))
-(defonce ^:private -duckdb_set_config (atom nil))
-(defonce ^:private -duckdb_destroy_config (atom nil))
+(defn- resolve-layout [k]
+  (if (keyword? k) (get layout-alias k) k))
 
-;; Query execution
-(defonce ^:private -duckdb_query (atom nil))
-(defonce ^:private -duckdb_destroy_result (atom nil))
-(defonce ^:private -duckdb_result_error (atom nil))
+(defmacro ^:private define-ffi-fns!
+  "From a spec vector, generates for each entry:
+     1. (defonce ^:private -name (atom nil))
+     2. A (reset! ...) form inside define-datatypes!
+     3. (defn name [args...] (coerce (mh-invoke @-name args...)))"
+  [specs]
+  (let [atom-defs   (for [[cname _ _ _] specs]
+                      (let [aname (symbol (str "-" cname))]
+                        `(defonce ^:private ~aname (atom nil))))
+        reset-forms (for [[cname ret args _] specs]
+                      (let [aname  (symbol (str "-" cname))
+                            ret-l  (resolve-layout ret)
+                            arg-ls (mapv resolve-layout args)]
+                        `(reset! ~aname
+                                 (fn-handle ~cname
+                                            ~(if (= ret :void)
+                                               `(FunctionDescriptor/ofVoid (into-array MemoryLayout ~arg-ls))
+                                               `(FunctionDescriptor/of ~ret-l (into-array MemoryLayout ~arg-ls)))))))
+        wrapper-fns (for [[cname _ args coerce] specs]
+                      (let [fname  (symbol cname)
+                            aname  (symbol (str "-" cname))
+                            params (mapv #(symbol (str "a" %)) (range (count args)))
+                            call   `(mh-invoke (deref ~aname) ~@params)]
+                        `(defn ~fname ~params
+                           ~(case coerce
+                              :int  `(int ~call)
+                              :long `(long ~call)
+                              call))))]
+    `(do
+       ~@atom-defs
 
-;; Result metadata
-(defonce ^:private -duckdb_column_count (atom nil))
-(defonce ^:private -duckdb_column_name (atom nil))
-(defonce ^:private -duckdb_column_logical_type (atom nil))
-(defonce ^:private -duckdb_get_type_id (atom nil))
-(defonce ^:private -duckdb_destroy_logical_type (atom nil))
+       (defn ~'define-datatypes! [^String ~'duckdb-home]
+         (let [~'lib    (load-lib ~'duckdb-home)
+               ~'linker (Linker/nativeLinker)]
+           (alter-var-root #'the-lib (constantly ~'lib))
+           (alter-var-root #'the-linker (constantly ~'linker))
+           ~@reset-forms))
 
-;; Chunk fetch
-(defonce ^:private -duckdb_fetch_chunk (atom nil))
-(defonce ^:private -duckdb_data_chunk_get_size (atom nil))
-(defonce ^:private -duckdb_data_chunk_get_vector (atom nil))
-(defonce ^:private -duckdb_vector_get_data (atom nil))
-(defonce ^:private -duckdb_vector_get_validity (atom nil))
-(defonce ^:private -duckdb_destroy_data_chunk (atom nil))
-
-;; Chunk write (appender)
-(defonce ^:private -duckdb_appender_create (atom nil))
-(defonce ^:private -duckdb_appender_destroy (atom nil))
-(defonce ^:private -duckdb_appender_error (atom nil))
-(defonce ^:private -duckdb_append_data_chunk (atom nil))
-(defonce ^:private -duckdb_vector_size (atom nil))
-(defonce ^:private -duckdb_create_data_chunk (atom nil))
-(defonce ^:private -duckdb_data_chunk_set_size (atom nil))
-(defonce ^:private -duckdb_data_chunk_reset (atom nil))
-(defonce ^:private -duckdb_create_logical_type (atom nil))
-(defonce ^:private -duckdb_vector_ensure_validity_writable (atom nil))
-
-;; Prepared statements
-(defonce ^:private -duckdb_prepare (atom nil))
-(defonce ^:private -duckdb_destroy_prepare (atom nil))
-(defonce ^:private -duckdb_prepare_error (atom nil))
-(defonce ^:private -duckdb_nparams (atom nil))
-(defonce ^:private -duckdb_param_type (atom nil))
-(defonce ^:private -duckdb_pending_prepared (atom nil))
-(defonce ^:private -duckdb_execute_pending (atom nil))
-(defonce ^:private -duckdb_destroy_pending (atom nil))
-(defonce ^:private -duckdb_pending_error (atom nil))
-
-;; Bind params
-(defonce ^:private -duckdb_bind_null (atom nil))
-(defonce ^:private -duckdb_bind_boolean (atom nil))
-(defonce ^:private -duckdb_bind_int8 (atom nil))
-(defonce ^:private -duckdb_bind_int16 (atom nil))
-(defonce ^:private -duckdb_bind_int32 (atom nil))
-(defonce ^:private -duckdb_bind_int64 (atom nil))
-(defonce ^:private -duckdb_bind_uint8 (atom nil))
-(defonce ^:private -duckdb_bind_uint16 (atom nil))
-(defonce ^:private -duckdb_bind_uint32 (atom nil))
-(defonce ^:private -duckdb_bind_uint64 (atom nil))
-(defonce ^:private -duckdb_bind_float (atom nil))
-(defonce ^:private -duckdb_bind_double (atom nil))
-(defonce ^:private -duckdb_bind_date (atom nil))
-(defonce ^:private -duckdb_bind_time (atom nil))
-(defonce ^:private -duckdb_bind_timestamp (atom nil))
-(defonce ^:private -duckdb_bind_varchar_length (atom nil))
+       ~@wrapper-fns)))
 
 ;; ---------------------------------------------------------------------------
-;; define-datatypes! — initialize library + all function handles
+;; The spec table — one row per C function
 ;; ---------------------------------------------------------------------------
 
-(defn define-datatypes! [^String duckdb-home]
-  (let [lib (load-lib duckdb-home)
-        linker (Linker/nativeLinker)]
-    (alter-var-root #'the-lib (constantly lib))
-    (alter-var-root #'the-linker (constantly linker))
-
-    ;; -- Database lifecycle --------------------------------------------------
-    (reset! -duckdb_open_ext
-      (fn-handle "duckdb_open_ext"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_close
-      (fn-handle "duckdb_close"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_connect
-      (fn-handle "duckdb_connect"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_disconnect
-      (fn-handle "duckdb_disconnect"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_library_version
-      (fn-handle "duckdb_library_version"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout []))))
-
-    (reset! -duckdb_free
-      (fn-handle "duckdb_free"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Config --------------------------------------------------------------
-    (reset! -duckdb_config_count
-      (fn-handle "duckdb_config_count"
-        (FunctionDescriptor/of ValueLayout/JAVA_LONG
-          (into-array MemoryLayout []))))
-
-    (reset! -duckdb_create_config
-      (fn-handle "duckdb_create_config"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_get_config_flag
-      (fn-handle "duckdb_get_config_flag"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [ValueLayout/JAVA_LONG VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_set_config
-      (fn-handle "duckdb_set_config"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_destroy_config
-      (fn-handle "duckdb_destroy_config"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Query execution -----------------------------------------------------
-    (reset! -duckdb_query
-      (fn-handle "duckdb_query"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_destroy_result
-      (fn-handle "duckdb_destroy_result"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_result_error
-      (fn-handle "duckdb_result_error"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Result metadata -----------------------------------------------------
-    (reset! -duckdb_column_count
-      (fn-handle "duckdb_column_count"
-        (FunctionDescriptor/of ValueLayout/JAVA_LONG
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_column_name
-      (fn-handle "duckdb_column_name"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_column_logical_type
-      (fn-handle "duckdb_column_logical_type"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_get_type_id
-      (fn-handle "duckdb_get_type_id"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_destroy_logical_type
-      (fn-handle "duckdb_destroy_logical_type"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Chunk fetch ---------------------------------------------------------
-    (reset! -duckdb_fetch_chunk
-      (fn-handle "duckdb_fetch_chunk"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [result-layout]))))
-
-    (reset! -duckdb_data_chunk_get_size
-      (fn-handle "duckdb_data_chunk_get_size"
-        (FunctionDescriptor/of ValueLayout/JAVA_LONG
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_data_chunk_get_vector
-      (fn-handle "duckdb_data_chunk_get_vector"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_vector_get_data
-      (fn-handle "duckdb_vector_get_data"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_vector_get_validity
-      (fn-handle "duckdb_vector_get_validity"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_destroy_data_chunk
-      (fn-handle "duckdb_destroy_data_chunk"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Chunk write (appender) ----------------------------------------------
-    (reset! -duckdb_appender_create
-      (fn-handle "duckdb_appender_create"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_appender_destroy
-      (fn-handle "duckdb_appender_destroy"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_appender_error
-      (fn-handle "duckdb_appender_error"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_append_data_chunk
-      (fn-handle "duckdb_append_data_chunk"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_vector_size
-      (fn-handle "duckdb_vector_size"
-        (FunctionDescriptor/of ValueLayout/JAVA_LONG
-          (into-array MemoryLayout []))))
-
-    (reset! -duckdb_create_data_chunk
-      (fn-handle "duckdb_create_data_chunk"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_data_chunk_set_size
-      (fn-handle "duckdb_data_chunk_set_size"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_data_chunk_reset
-      (fn-handle "duckdb_data_chunk_reset"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_create_logical_type
-      (fn-handle "duckdb_create_logical_type"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [ValueLayout/JAVA_INT]))))
-
-    (reset! -duckdb_vector_ensure_validity_writable
-      (fn-handle "duckdb_vector_ensure_validity_writable"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Prepared statements -------------------------------------------------
-    (reset! -duckdb_prepare
-      (fn-handle "duckdb_prepare"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_destroy_prepare
-      (fn-handle "duckdb_destroy_prepare"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_prepare_error
-      (fn-handle "duckdb_prepare_error"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_nparams
-      (fn-handle "duckdb_nparams"
-        (FunctionDescriptor/of ValueLayout/JAVA_LONG
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_param_type
-      (fn-handle "duckdb_param_type"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_pending_prepared
-      (fn-handle "duckdb_pending_prepared"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_execute_pending
-      (fn-handle "duckdb_execute_pending"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR VL-ADDR]))))
-
-    (reset! -duckdb_destroy_pending
-      (fn-handle "duckdb_destroy_pending"
-        (FunctionDescriptor/ofVoid
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    (reset! -duckdb_pending_error
-      (fn-handle "duckdb_pending_error"
-        (FunctionDescriptor/of VL-ADDR
-          (into-array MemoryLayout [VL-ADDR]))))
-
-    ;; -- Bind params ---------------------------------------------------------
-    (reset! -duckdb_bind_null
-      (fn-handle "duckdb_bind_null"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_bind_boolean
-      (fn-handle "duckdb_bind_boolean"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_BYTE]))))
-
-    (reset! -duckdb_bind_int8
-      (fn-handle "duckdb_bind_int8"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_BYTE]))))
-
-    (reset! -duckdb_bind_int16
-      (fn-handle "duckdb_bind_int16"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_SHORT]))))
-
-    (reset! -duckdb_bind_int32
-      (fn-handle "duckdb_bind_int32"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_INT]))))
-
-    (reset! -duckdb_bind_int64
-      (fn-handle "duckdb_bind_int64"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_bind_uint8
-      (fn-handle "duckdb_bind_uint8"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_BYTE]))))
-
-    (reset! -duckdb_bind_uint16
-      (fn-handle "duckdb_bind_uint16"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_SHORT]))))
-
-    (reset! -duckdb_bind_uint32
-      (fn-handle "duckdb_bind_uint32"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_INT]))))
-
-    (reset! -duckdb_bind_uint64
-      (fn-handle "duckdb_bind_uint64"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_bind_float
-      (fn-handle "duckdb_bind_float"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_FLOAT]))))
-
-    (reset! -duckdb_bind_double
-      (fn-handle "duckdb_bind_double"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_DOUBLE]))))
-
-    (reset! -duckdb_bind_date
-      (fn-handle "duckdb_bind_date"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_INT]))))
-
-    (reset! -duckdb_bind_time
-      (fn-handle "duckdb_bind_time"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_bind_timestamp
-      (fn-handle "duckdb_bind_timestamp"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG ValueLayout/JAVA_LONG]))))
-
-    (reset! -duckdb_bind_varchar_length
-      (fn-handle "duckdb_bind_varchar_length"
-        (FunctionDescriptor/of ValueLayout/JAVA_INT
-          (into-array MemoryLayout [VL-ADDR ValueLayout/JAVA_LONG VL-ADDR ValueLayout/JAVA_LONG]))))))
+(define-ffi-fns!
+  [;; Database lifecycle
+   ["duckdb_open_ext"           :int  [:addr :addr :addr :addr]  :int]
+   ["duckdb_close"              :void [:addr]                    nil]
+   ["duckdb_connect"            :int  [:addr :addr]              :int]
+   ["duckdb_disconnect"         :void [:addr]                    nil]
+   ["duckdb_library_version"    :addr []                         nil]
+   ["duckdb_free"               :void [:addr]                    nil]
+   ;; Config
+   ["duckdb_config_count"       :long []                         :long]
+   ["duckdb_create_config"      :int  [:addr]                    :int]
+   ["duckdb_get_config_flag"    :int  [:long :addr :addr]        :int]
+   ["duckdb_set_config"         :int  [:addr :addr :addr]        :int]
+   ["duckdb_destroy_config"     :void [:addr]                    nil]
+   ;; Query execution
+   ["duckdb_query"              :int  [:addr :addr :addr]        :int]
+   ["duckdb_destroy_result"     :void [:addr]                    nil]
+   ["duckdb_result_error"       :addr [:addr]                    nil]
+   ;; Result metadata
+   ["duckdb_column_count"       :long [:addr]                    :long]
+   ["duckdb_column_name"        :addr [:addr :long]              nil]
+   ["duckdb_column_logical_type" :addr [:addr :long]             nil]
+   ["duckdb_get_type_id"        :int  [:addr]                    :int]
+   ["duckdb_destroy_logical_type" :void [:addr]                  nil]
+   ;; Chunk fetch  (fetch_chunk takes result struct BY VALUE)
+   ["duckdb_fetch_chunk"        :addr [:result]                  nil]
+   ["duckdb_data_chunk_get_size" :long [:addr]                   :long]
+   ["duckdb_data_chunk_get_vector" :addr [:addr :long]           nil]
+   ["duckdb_vector_get_data"    :addr [:addr]                    nil]
+   ["duckdb_vector_get_validity" :addr [:addr]                   nil]
+   ["duckdb_destroy_data_chunk" :void [:addr]                    nil]
+   ;; Chunk write / appender
+   ["duckdb_appender_create"    :int  [:addr :addr :addr :addr]  :int]
+   ["duckdb_appender_destroy"   :int  [:addr]                    :int]
+   ["duckdb_appender_error"     :addr [:addr]                    nil]
+   ["duckdb_append_data_chunk"  :int  [:addr :addr]              :int]
+   ["duckdb_vector_size"        :long []                         :long]
+   ["duckdb_create_data_chunk"  :addr [:addr :long]              nil]
+   ["duckdb_data_chunk_set_size" :void [:addr :long]             nil]
+   ["duckdb_data_chunk_reset"   :void [:addr]                    nil]
+   ["duckdb_create_logical_type" :addr [:int]                    nil]
+   ["duckdb_vector_ensure_validity_writable" :void [:addr]       nil]
+   ;; Prepared statements
+   ["duckdb_prepare"            :int  [:addr :addr :addr]        :int]
+   ["duckdb_destroy_prepare"    :void [:addr]                    nil]
+   ["duckdb_prepare_error"      :addr [:addr]                    nil]
+   ["duckdb_nparams"            :long [:addr]                    :long]
+   ["duckdb_param_type"         :int  [:addr :long]              :int]
+   ["duckdb_pending_prepared"   :int  [:addr :addr]              :int]
+   ["duckdb_execute_pending"    :int  [:addr :addr]              :int]
+   ["duckdb_destroy_pending"    :void [:addr]                    nil]
+   ["duckdb_pending_error"      :addr [:addr]                    nil]
+   ;; Bind params
+   ["duckdb_bind_null"          :int  [:addr :long]              :int]
+   ["duckdb_bind_boolean"       :int  [:addr :long :byte]        :int]
+   ["duckdb_bind_int8"          :int  [:addr :long :byte]        :int]
+   ["duckdb_bind_int16"         :int  [:addr :long :short]       :int]
+   ["duckdb_bind_int32"         :int  [:addr :long :int]         :int]
+   ["duckdb_bind_int64"         :int  [:addr :long :long]        :int]
+   ["duckdb_bind_uint8"         :int  [:addr :long :byte]        :int]
+   ["duckdb_bind_uint16"        :int  [:addr :long :short]       :int]
+   ["duckdb_bind_uint32"        :int  [:addr :long :int]         :int]
+   ["duckdb_bind_uint64"        :int  [:addr :long :long]        :int]
+   ["duckdb_bind_float"         :int  [:addr :long :float]       :int]
+   ["duckdb_bind_double"        :int  [:addr :long :double]      :int]
+   ["duckdb_bind_date"          :int  [:addr :long :int]         :int]
+   ["duckdb_bind_time"          :int  [:addr :long :long]        :int]
+   ["duckdb_bind_timestamp"     :int  [:addr :long :long]        :int]
+   ["duckdb_bind_varchar_length" :int [:addr :long :addr :long]  :int]])
 
 ;; ---------------------------------------------------------------------------
-;; 7. Helper functions
+;; Helper functions
 ;; ---------------------------------------------------------------------------
 
 (defn alloc-c-str ^MemorySegment [^Arena arena ^String s]
@@ -521,202 +249,11 @@
   (when (and ptr (not= 0 (.address ptr)))
     (.getString (.reinterpret ptr Long/MAX_VALUE) 0)))
 
-;; ---------------------------------------------------------------------------
-;; 8. Public API wrappers
-;; ---------------------------------------------------------------------------
-
-;; -- Database lifecycle ------------------------------------------------------
-
-(defn duckdb_library_version []
-  (mh-invoke @-duckdb_library_version))
-
-(defn duckdb_open_ext [path out-db config out-error]
-  (int (mh-invoke @-duckdb_open_ext path out-db config out-error)))
-
-(defn duckdb_close [db-ptr]
-  (mh-invoke @-duckdb_close db-ptr))
-
-(defn duckdb_connect [db out-conn]
-  (int (mh-invoke @-duckdb_connect db out-conn)))
-
-(defn duckdb_disconnect [conn-ptr]
-  (mh-invoke @-duckdb_disconnect conn-ptr))
-
-(defn duckdb_free [ptr]
-  (mh-invoke @-duckdb_free ptr))
-
-;; -- Config ------------------------------------------------------------------
-
-(defn duckdb_config_count []
-  (long (mh-invoke @-duckdb_config_count)))
-
-(defn duckdb_create_config [out-config]
-  (int (mh-invoke @-duckdb_create_config out-config)))
-
-(defn duckdb_get_config_flag [idx out-name out-desc]
-  (int (mh-invoke @-duckdb_get_config_flag idx out-name out-desc)))
-
-(defn duckdb_set_config [config name option]
-  (int (mh-invoke @-duckdb_set_config config name option)))
-
-(defn duckdb_destroy_config [config-ptr]
-  (mh-invoke @-duckdb_destroy_config config-ptr))
-
-;; -- Query execution ---------------------------------------------------------
-
-(defn duckdb_query [conn sql out-result]
-  (int (mh-invoke @-duckdb_query conn sql out-result)))
-
-(defn duckdb_destroy_result [result-ptr]
-  (mh-invoke @-duckdb_destroy_result result-ptr))
-
-(defn duckdb_result_error [result-ptr]
-  (mh-invoke @-duckdb_result_error result-ptr))
-
-;; -- Result metadata ---------------------------------------------------------
-
-(defn duckdb_column_count [result-ptr]
-  (long (mh-invoke @-duckdb_column_count result-ptr)))
-
-(defn duckdb_column_name [result-ptr col]
-  (mh-invoke @-duckdb_column_name result-ptr col))
-
-(defn duckdb_column_logical_type [result-ptr col]
-  (mh-invoke @-duckdb_column_logical_type result-ptr col))
-
-(defn duckdb_get_type_id [logical-type]
-  (int (mh-invoke @-duckdb_get_type_id logical-type)))
-
-(defn duckdb_destroy_logical_type [type-ptr]
-  (mh-invoke @-duckdb_destroy_logical_type type-ptr))
-
-;; -- Chunk fetch -------------------------------------------------------------
-
-(defn duckdb_fetch_chunk [result-seg]
-  (mh-invoke @-duckdb_fetch_chunk result-seg))
-
-(defn duckdb_data_chunk_get_size [chunk]
-  (long (mh-invoke @-duckdb_data_chunk_get_size chunk)))
-
-(defn duckdb_data_chunk_get_vector [chunk col]
-  (mh-invoke @-duckdb_data_chunk_get_vector chunk col))
-
-(defn duckdb_vector_get_data [vec]
-  (mh-invoke @-duckdb_vector_get_data vec))
-
-(defn duckdb_vector_get_validity [vec]
-  (mh-invoke @-duckdb_vector_get_validity vec))
-
-(defn duckdb_destroy_data_chunk [chunk-ptr]
-  (mh-invoke @-duckdb_destroy_data_chunk chunk-ptr))
-
-;; -- Chunk write (appender) --------------------------------------------------
-
-(defn duckdb_appender_create [conn schema table out-appender]
-  (int (mh-invoke @-duckdb_appender_create conn schema table out-appender)))
-
-(defn duckdb_appender_destroy [appender-ptr]
-  (int (mh-invoke @-duckdb_appender_destroy appender-ptr)))
-
-(defn duckdb_appender_error [appender]
-  (mh-invoke @-duckdb_appender_error appender))
-
-(defn duckdb_append_data_chunk [appender chunk]
-  (int (mh-invoke @-duckdb_append_data_chunk appender chunk)))
-
-(defn duckdb_vector_size []
-  (long (mh-invoke @-duckdb_vector_size)))
-
-(defn duckdb_create_data_chunk [types n-cols]
-  (mh-invoke @-duckdb_create_data_chunk types n-cols))
-
-(defn duckdb_data_chunk_set_size [chunk size]
-  (mh-invoke @-duckdb_data_chunk_set_size chunk size))
-
-(defn duckdb_data_chunk_reset [chunk]
-  (mh-invoke @-duckdb_data_chunk_reset chunk))
-
-(defn duckdb_create_logical_type [type-id]
-  (mh-invoke @-duckdb_create_logical_type type-id))
-
-(defn duckdb_vector_ensure_validity_writable [vec]
-  (mh-invoke @-duckdb_vector_ensure_validity_writable vec))
-
-;; -- Prepared statements -----------------------------------------------------
-
-(defn duckdb_prepare [conn sql out-stmt]
-  (int (mh-invoke @-duckdb_prepare conn sql out-stmt)))
-
-(defn duckdb_destroy_prepare [stmt-ptr]
-  (mh-invoke @-duckdb_destroy_prepare stmt-ptr))
-
-(defn duckdb_prepare_error [stmt]
-  (mh-invoke @-duckdb_prepare_error stmt))
-
-(defn duckdb_nparams [stmt]
-  (long (mh-invoke @-duckdb_nparams stmt)))
-
-(defn duckdb_param_type [stmt idx]
-  (int (mh-invoke @-duckdb_param_type stmt idx)))
-
-(defn duckdb_pending_prepared [stmt out-pending]
-  (int (mh-invoke @-duckdb_pending_prepared stmt out-pending)))
-
-(defn duckdb_execute_pending [pending out-result]
-  (int (mh-invoke @-duckdb_execute_pending pending out-result)))
-
-(defn duckdb_destroy_pending [pending-ptr]
-  (mh-invoke @-duckdb_destroy_pending pending-ptr))
-
-(defn duckdb_pending_error [pending]
-  (mh-invoke @-duckdb_pending_error pending))
-
-;; -- Bind params -------------------------------------------------------------
-
-(defn duckdb_bind_null [stmt idx]
-  (int (mh-invoke @-duckdb_bind_null stmt idx)))
-
-(defn duckdb_bind_boolean [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_boolean stmt idx val)))
-
-(defn duckdb_bind_int8 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_int8 stmt idx val)))
-
-(defn duckdb_bind_int16 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_int16 stmt idx val)))
-
-(defn duckdb_bind_int32 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_int32 stmt idx val)))
-
-(defn duckdb_bind_int64 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_int64 stmt idx val)))
-
-(defn duckdb_bind_uint8 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_uint8 stmt idx val)))
-
-(defn duckdb_bind_uint16 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_uint16 stmt idx val)))
-
-(defn duckdb_bind_uint32 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_uint32 stmt idx val)))
-
-(defn duckdb_bind_uint64 [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_uint64 stmt idx val)))
-
-(defn duckdb_bind_float [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_float stmt idx val)))
-
-(defn duckdb_bind_double [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_double stmt idx val)))
-
-(defn duckdb_bind_date [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_date stmt idx val)))
-
-(defn duckdb_bind_time [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_time stmt idx val)))
-
-(defn duckdb_bind_timestamp [stmt idx val]
-  (int (mh-invoke @-duckdb_bind_timestamp stmt idx val)))
-
-(defn duckdb_bind_varchar_length [stmt idx val len]
-  (int (mh-invoke @-duckdb_bind_varchar_length stmt idx val len)))
+(defn destroy-ptr!
+  "Allocate a pointer-to-pointer, store `seg`'s address, call `destroy-fn` on it.
+  Common pattern for duckdb_destroy_* functions that take T* (pointer to handle)."
+  [destroy-fn ^MemorySegment seg]
+  (with-open [a (Arena/ofConfined)]
+    (let [p (.allocate a VL-ADDR)]
+      (.set p VL-ADDR 0 seg)
+      (destroy-fn p))))
