@@ -11,6 +11,17 @@
          :extra-paths ["test"]
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
          :main-opts ["-m" "cognitect.test-runner"]}
-  :dev {:extra-deps  {com.taoensso/telemere {:mvn/version "1.2.1"}}
+  :dev {:extra-deps  {com.taoensso/telemere {:mvn/version "1.2.1"}
+                      com.techascent/tmducken {:mvn/version "0.10.1-01"}
+                      com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.2"}
+                      criterium/criterium {:mvn/version "0.4.6"}}
         :extra-paths ["test" "dev"]
-        :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
+        :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                   "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   ;; clj-async-profiler — required to attach the JVMTI agent
+                   "-Djdk.attach.allowAttachSelf"
+                   ;; Improves profile accuracy (inlined frames stay visible)
+                   "-XX:+UnlockDiagnosticVMOptions"
+                   "-XX:+DebugNonSafepoints"
+                   ;; Silences "dynamic loading of agents was deprecated" warning on JDK 21+
+                   "-XX:+EnableDynamicAgentLoading"]}}}

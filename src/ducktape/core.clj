@@ -12,6 +12,7 @@
   (:import [java.lang.foreign Arena MemoryLayout MemorySegment]
            [java.math BigInteger BigDecimal]
            [java.util UUID]
+           [java.util.concurrent.atomic LongAdder]
            [java.util.function Supplier]
            [java.time LocalDate LocalTime Instant]
            [ham_fisted ITypedReduce IFnDef]
@@ -244,20 +245,17 @@
 
 (defn- write-uuid!
   [^MemorySegment data-ptr subcol ^long row-count]
-  (let [base-addr (.address data-ptr)]
-    (dorun
-     (hamf/pgroups row-count
-                   (fn [^long sidx ^long eidx]
-                     (let [^MemorySegment dseg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
-                                                             (* (- eidx sidx) 16))]
-                       (dotimes [i (- eidx sidx)]
-                         (let [^UUID uuid (subcol (+ sidx i))
-                               off (long (* i 16))]
-                           (if uuid
-                             (do (.set dseg ffi/VL-LONG off (.getLeastSignificantBits uuid))
-                                 (.set dseg ffi/VL-LONG (+ off 8) (.getMostSignificantBits uuid)))
-                             (do (.set dseg ffi/VL-LONG off (long 0))
-                                 (.set dseg ffi/VL-LONG (+ off 8) (long 0))))))))))))
+  ;; Fill a JVM long array (no bounds-check overhead), then bulk-copy to native memory
+  (let [n2 (long (* 2 row-count))
+        ^longs bits (long-array n2)]
+    (dotimes [i row-count]
+      (let [^UUID uuid (subcol i)
+            off (long (* 2 i))]
+        (when uuid
+          (aset bits off (.getLeastSignificantBits uuid))
+          (aset bits (unchecked-inc off) (.getMostSignificantBits uuid)))))
+    (let [^MemorySegment dseg (.reinterpret data-ptr (* 16 row-count))]
+      (MemorySegment/copy bits 0 dseg ffi/VL-LONG (long 0) (int n2)))))
 
 (defn- write-string!
   [^Arena arena ^MemorySegment data-ptr subcol ^long row-count]
@@ -835,6 +833,69 @@
   ([conn dataset] (insert-dataset! conn dataset nil)))
 
 ;; ---------------------------------------------------------------------------
+;; 7b. Read-path instrumentation (dev-only, off by default; zero overhead off)
+;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *instrument-stats*
+  "When bound to a Map<Keyword, LongAdder>, per-phase timings/counters
+  accumulate here. nil by default — single var-deref + nil-check overhead."
+  nil)
+
+(defmacro ^:private instr-time
+  "Time `body`, accumulate ns into the LongAdder at `phase-kw` if instrumentation
+  is enabled. When disabled, just runs body."
+  [phase-kw & body]
+  `(let [m# *instrument-stats*]
+     (if (nil? m#)
+       (do ~@body)
+       (let [t0# (System/nanoTime)
+             r#  (do ~@body)
+             t1# (System/nanoTime)]
+         (when-let [^LongAdder a# (.get ^java.util.Map m# ~phase-kw)]
+           (.add a# (- t1# t0#)))
+         r#))))
+
+(defn- instr-inc!
+  "Increment a counter by 1 (or n)."
+  ([phase-kw] (instr-inc! phase-kw 1))
+  ([phase-kw n]
+   (when-let [^java.util.Map m *instrument-stats*]
+     (when-let [^LongAdder a (.get m phase-kw)]
+       (.add a (long n))))))
+
+(defn new-instr-buf
+  "Build a fresh instrumentation buffer with all known phase counters."
+  ^java.util.Map []
+  (doto (java.util.HashMap.)
+    ;; ns timings
+    (.put :fetch-ns             (LongAdder.))
+    (.put :realize-wallclock-ns (LongAdder.))
+    (.put :validity-ns          (LongAdder.))
+    (.put :buffer-ns            (LongAdder.))
+    (.put :clone-cpu-ns         (LongAdder.))
+    (.put :deref-wait-ns        (LongAdder.))
+    (.put :concat-ns            (LongAdder.))
+    ;; counters
+    (.put :chunks               (LongAdder.))
+    (.put :columns              (LongAdder.))
+    (.put :clones               (LongAdder.))))
+
+(defn instr-snapshot
+  "Snapshot the instrumentation buffer to a sorted map of {phase sum}."
+  [^java.util.Map m]
+  (into (sorted-map)
+        (map (fn [[k ^LongAdder a]] [k (.sum a)]))
+        m))
+
+(defmacro with-instrumentation
+  "Bind a fresh instrumentation buffer for `body`. Returns [result snapshot]."
+  [& body]
+  `(let [buf# (new-instr-buf)]
+     (binding [*instrument-stats* buf#]
+       (let [r# (do ~@body)]
+         [r# (instr-snapshot buf#)]))))
+
+;; ---------------------------------------------------------------------------
 ;; 8. Read path — validity->missing and coldata->buffer
 ;; ---------------------------------------------------------------------------
 
@@ -890,30 +951,24 @@
       ;; Complex types
       (case type-kw
         :DUCKDB_TYPE_UUID
-        (let [base-addr data-ptr]
+        (let [base-addr data-ptr
+              ^sun.misc.Unsafe u ffi/UNSAFE]
           (reify
             ObjectReader
             (elemwiseDatatype [_] :uuid)
             (lsize [_] n-rows)
             (readObject [_ idx]
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* idx 16))) 16)
-                    low (.get seg ffi/VL-LONG (long 0))
-                    high (.get seg ffi/VL-LONG (long 8))]
-                (UUID. high low)))
+              (let [addr (+ base-addr (* idx 16))]
+                (UUID. (.getLong u (+ addr 8))
+                       (.getLong u addr))))
             dt-proto/PClone
             (clone [_]
-              ;; Parallel UUID decode
+              ;; Unsafe raw reads; cross-column parallelism via futures in realize-chunk
               (let [^objects out (make-array UUID n-rows)]
-                (dorun
-                 (hamf/pgroups n-rows
-                               (fn [^long sidx ^long eidx]
-                                 (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
-                                                                        (* (- eidx sidx) 16))]
-                                   (dotimes [i (- eidx sidx)]
-                                     (let [off (long (* i 16))]
-                                       (aset out (int (+ sidx i))
-                                             (UUID. (.get seg ffi/VL-LONG (+ off 8))
-                                                    (.get seg ffi/VL-LONG off)))))))))
+                (dotimes [i n-rows]
+                  (let [addr (+ base-addr (* i 16))]
+                    (aset out (int i) (UUID. (.getLong u (+ addr 8))
+                                             (.getLong u addr)))))
                 (hamf/wrap-array out)))))
 
         :DUCKDB_TYPE_VARCHAR
@@ -1234,16 +1289,18 @@
   ITypedReduce
   (reduce [_ rfn acc]
     (loop [acc acc]
-      (let [^MemorySegment chunk (ffi/duckdb_fetch_chunk result-seg)]
+      (let [^MemorySegment chunk (instr-time :fetch-ns (ffi/duckdb_fetch_chunk result-seg))]
         (if (and chunk (not= 0 (.address chunk)) (not (reduced? acc)))
-          (let [result (case reduce-type
-                         :clone
-                         (let [ds (realize-chunk chunk true)]
-                           (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
-                           (rfn acc ds))
-                         :zero-copy
-                         (rfn acc (realize-chunk chunk false)))]
-            (recur result))
+          (do
+            (instr-inc! :chunks)
+            (let [result (case reduce-type
+                           :clone
+                           (let [ds (realize-chunk chunk true)]
+                             (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
+                             (rfn acc ds))
+                           :zero-copy
+                           (rfn acc (realize-chunk chunk false)))]
+              (recur result)))
           (do
             ;; Destroy last null chunk if needed
             (when (and chunk (not= 0 (.address chunk)))
@@ -1339,32 +1396,38 @@
                          (range n-cols))
         key-fn (get options :key-fn identity)
         realize-chunk (fn [^MemorySegment data-chunk clone?]
-                        (let [n-rows (ffi/duckdb_data_chunk_get_size data-chunk)
-                              colmap (hamf/mut-map)
-                              ;; Phase 1: build coldata + launch parallel clones (delays)
-                              col-specs
-                              (mapv (fn [cidx]
-                                      (let [^MemorySegment vdata (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
-                                            ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
-                                            ^MemorySegment val-ptr (ffi/duckdb_vector_get_validity vdata)
-                                            missing (validity->missing n-rows val-ptr)
-                                            coldata (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata)
-                                            cname (key-fn (names cidx))
-                                            ;; Launch clone as delay — for strings/UUIDs, PClone
-                                            ;; implementations use hamf/pgroups internally so all
-                                            ;; columns start their parallel work here
-                                            delayed (if clone? (delay (dt/clone coldata)) (delay coldata))]
-                                        (.put colmap cname cidx)
-                                        [missing delayed cname]))
-                                    (range n-cols))
-                              ;; Phase 2: force all clones and build columns
-                              columns (mapv (fn [[missing delayed cname]]
-                                              (Column. missing @delayed {:name cname} nil))
-                                            col-specs)]
-                          (Dataset. (vec columns)
-                                    (persistent! colmap)
-                                    {:name :_unnamed}
-                                    0 0)))
+                        (instr-time :realize-wallclock-ns
+                         (let [n-rows (ffi/duckdb_data_chunk_get_size data-chunk)
+                               colmap (hamf/mut-map)
+                               ;; Build delays that construct the Column. Each future runs
+                               ;; clone eagerly in the agent pool, so cloning across columns
+                               ;; overlaps. Forcing them via mapv deref awaits all in parallel.
+                               columns
+                               (hamf/mapv
+                                (fn [cidx]
+                                  (instr-inc! :columns)
+                                  (let [^MemorySegment vdata (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
+                                        ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
+                                        ^MemorySegment val-ptr (ffi/duckdb_vector_get_validity vdata)
+                                        missing (instr-time :validity-ns
+                                                  (validity->missing n-rows val-ptr))
+                                        coldata (instr-time :buffer-ns
+                                                  (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata))
+                                        cname (key-fn (names cidx))
+                                        delayed-data (if clone?
+                                                       (do (instr-inc! :clones)
+                                                           (future (instr-time :clone-cpu-ns
+                                                                     (dt/clone coldata))))
+                                                       (delay coldata))]
+                                    (.put colmap cname cidx)
+                                    (delay (Column. missing @delayed-data {:name cname} nil))))
+                                (hamf/range n-cols))
+                               col-data (instr-time :deref-wait-ns
+                                          (hamf/mapv deref columns))]
+                           (Dataset. col-data
+                                     (persistent! colmap)
+                                     {:name :_unnamed}
+                                     0 0))))
         reduce-type (get options :reduce-type :clone)]
     (ResultChunks. sql result-seg destroy-result* realize-chunk reduce-type)))
 
@@ -1375,8 +1438,8 @@
 (defn- datasets->dataset [^AutoCloseable results]
   (let [dsdata (vec results)]
     (if (== 1 (count dsdata))
-      (dt/clone (dsdata 0))
-      (apply ds/concat dsdata))))
+      (instr-time :concat-ns (dt/clone (dsdata 0)))
+      (instr-time :concat-ns (apply ds/concat dsdata)))))
 
 ;; ---------------------------------------------------------------------------
 ;; 12. Prepared statements
