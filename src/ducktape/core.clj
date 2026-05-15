@@ -132,20 +132,19 @@
 
 (defn run-query!
   "Execute a SQL statement, ignoring results. Used for DDL."
-  ([^long conn ^String sql options]
-   (with-open [arena (Arena/ofConfined)]
-     (let [result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
-           rc (ffi/duckdb_query
-               (MemorySegment/ofAddress conn)
-               (ffi/alloc-c-str arena sql)
-               result)]
-       (when-not (== rc ffi/DuckDBSuccess)
-         (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result))]
-           (ffi/duckdb_destroy_result result)
-           (throw (Exception. err))))
-       (ffi/duckdb_destroy_result result)
-       :ok)))
-  ([conn sql] (run-query! conn sql nil)))
+  [^long conn ^String sql]
+  (with-open [arena (Arena/ofConfined)]
+    (let [result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
+          rc (ffi/duckdb_query
+              (MemorySegment/ofAddress conn)
+              (ffi/alloc-c-str arena sql)
+              result)]
+      (when-not (== rc ffi/DuckDBSuccess)
+        (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result))]
+          (ffi/duckdb_destroy_result result)
+          (throw (Exception. err))))
+      (ffi/duckdb_destroy_result result)
+      :ok)))
 
 ;; ---------------------------------------------------------------------------
 ;; 6. create-table! / drop-table!
@@ -287,7 +286,7 @@
                          (let [^bytes sbytes (aget encoded (int (+ sidx i)))
                                slen (alength sbytes)
                                off (long (* i 16))]
-                           (.set dseg ffi/VL-INT off (int slen))
+                           (.set dseg ffi/VL-INT off slen)
                            (if (<= slen 12)
                              (MemorySegment/copy sbytes 0 dseg ffi/VL-BYTE (+ off 4) slen)
                              ;; Bump-allocate from slab (lock-free via AtomicLong)
@@ -322,7 +321,7 @@
           (let [^bytes b v
                 blen (alength b)
                 off (long (* i 16))]
-            (.set dseg ffi/VL-INT off (int blen))
+            (.set dseg ffi/VL-INT off blen)
             (if (<= blen 12)
               (MemorySegment/copy b 0 dseg ffi/VL-BYTE (+ off 4) blen)
               (let [slab-off (.getAndAdd slab-offset (long blen))
@@ -469,7 +468,7 @@
         (dotimes [i row-count]
           (let [v (subcol i)
                 idx (int (get dict-reverse (if (string? v) v (str v)) 0))]
-            (.set seg ffi/VL-INT (long (* i 4)) (int idx))))))))
+            (.set seg ffi/VL-INT (long (* i 4)) idx)))))))
 
 (defn- write-column!
   "Write `subcol` data into DuckDB vector memory at `data-ptr`."
@@ -534,42 +533,42 @@
         ^MemorySegment child-data (ffi/duckdb_vector_get_data child-vec)
         ^MemorySegment child-validity (ffi/duckdb_vector_get_validity child-vec)
         child-type-kw (get ffi/duckdb-type-map (long (:type-id child-type-info)))
-        child-dtype (get duckdb-type->write-dtype child-type-kw)]
+        child-dtype (get duckdb-type->write-dtype child-type-kw)
+        flat-vals (object-array total-children)
+        child-missing (RoaringBitmap.)]
     ;; Phase 1: write list_entry_t offsets/lengths and collect flat child data
-    (let [flat-vals (object-array total-children)
-          child-missing (RoaringBitmap.)]
-      (loop [i 0 offset 0]
-        (when (< i row-count)
-          (let [v (subcol i)
-                entry-off (long (* i 16))]
-            (if (and v (sequential? v))
-              (let [n (count v)]
-                (.set entry-seg ffi/VL-LONG entry-off (long offset))
-                (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
-                (dotimes [j n]
-                  (let [elem (nth v j)
-                        ci (+ offset j)]
-                    (if (nil? elem)
-                      (.add child-missing (int ci))
-                      (aset flat-vals ci elem))))
-                (recur (unchecked-inc i) (+ offset n)))
-              (do
-                (.set entry-seg ffi/VL-LONG entry-off (long offset))
-                (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long 0))
-                (recur (unchecked-inc i) offset))))))
-      ;; Phase 2: write child validity
-      (let [n-valid-words (long (Math/ceil (/ (double total-children) 64)))
-            ^MemorySegment cval-seg (.reinterpret child-validity (* n-valid-words 8))]
-        (write-validity! cval-seg child-missing total-children))
-      ;; Phase 3: write child data using existing infrastructure
-      (when (and child-dtype (pos? total-children))
-        (let [flat-reader (reify ObjectReader
-                            (lsize [_] total-children)
-                            (readObject [_ idx]
-                              ;; Return default (0) for nil entries — validity bitmap handles nulls
-                              (let [v (aget flat-vals idx)]
-                                (if (nil? v) (long 0) v))))]
-          (write-column! arena child-data flat-reader total-children child-dtype (.address child-data)))))))
+    (loop [i 0 offset 0]
+      (when (< i row-count)
+        (let [v (subcol i)
+              entry-off (long (* i 16))]
+          (if (and v (sequential? v))
+            (let [n (count v)]
+              (.set entry-seg ffi/VL-LONG entry-off (long offset))
+              (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
+              (dotimes [j n]
+                (let [elem (nth v j)
+                      ci (+ offset j)]
+                  (if (nil? elem)
+                    (.add child-missing (int ci))
+                    (aset flat-vals ci elem))))
+              (recur (unchecked-inc i) (+ offset n)))
+            (do
+              (.set entry-seg ffi/VL-LONG entry-off (long offset))
+              (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long 0))
+              (recur (unchecked-inc i) offset))))))
+    ;; Phase 2: write child validity
+    (let [n-valid-words (long (Math/ceil (/ (double total-children) 64)))
+          ^MemorySegment cval-seg (.reinterpret child-validity (* n-valid-words 8))]
+      (write-validity! cval-seg child-missing total-children))
+    ;; Phase 3: write child data using existing infrastructure
+    (when (and child-dtype (pos? total-children))
+      (let [flat-reader (reify ObjectReader
+                          (lsize [_] total-children)
+                          (readObject [_ idx]
+                            ;; Return default (0) for nil entries — validity bitmap handles nulls
+                            (let [v (aget flat-vals idx)]
+                              (if (nil? v) (long 0) v))))]
+        (write-column! arena child-data flat-reader total-children child-dtype (.address child-data))))))
 
 (defn- write-map!
   "Write a column of Clojure maps into a DuckDB MAP vector (LIST<STRUCT{key,value}>)."
@@ -599,48 +598,48 @@
         key-type-kw (get ffi/duckdb-type-map (long (:type-id key-type-info)))
         val-type-kw (get ffi/duckdb-type-map (long (:type-id val-type-info)))
         key-dtype (get duckdb-type->write-dtype key-type-kw)
-        val-dtype (get duckdb-type->write-dtype val-type-kw)]
-    ;; Flatten keys and values, write list entries
-    (let [^objects flat-keys (object-array total-entries)
-          ^objects flat-vals (object-array total-entries)
-          key-missing (RoaringBitmap.)
-          val-missing (RoaringBitmap.)]
-      (loop [i 0 offset 0]
-        (when (< i row-count)
-          (let [v (subcol i)
-                entry-off (long (* i 16))]
-            (if (and v (map? v))
-              (let [entries (seq v)
-                    n (count entries)]
-                (.set entry-seg ffi/VL-LONG entry-off (long offset))
-                (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
-                (loop [es entries j 0]
-                  (when es
-                    (let [[k vv] (first es)
-                          ci (+ offset j)]
-                      (if (nil? k) (.add key-missing (int ci)) (aset flat-keys ci k))
-                      (if (nil? vv) (.add val-missing (int ci)) (aset flat-vals ci vv))
-                      (recur (next es) (unchecked-inc j)))))
-                (recur (unchecked-inc i) (+ offset n)))
-              (do
-                (.set entry-seg ffi/VL-LONG entry-off (long offset))
-                (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long 0))
-                (recur (unchecked-inc i) offset))))))
-      ;; Write key/value validity
-      (when (pos? total-entries)
-        (let [nw (long (Math/ceil (/ (double total-entries) 64)))]
-          (write-validity! (.reinterpret key-validity (* nw 8)) key-missing total-entries)
-          (write-validity! (.reinterpret val-validity (* nw 8)) val-missing total-entries)))
-      ;; Write key data
-      (when (and key-dtype (pos? total-entries))
-        (let [kr (reify ObjectReader (lsize [_] total-entries)
-                   (readObject [_ idx] (let [v (aget flat-keys idx)] (if (nil? v) "" v))))]
-          (write-column! arena key-data kr total-entries key-dtype (.address key-data))))
-      ;; Write value data
-      (when (and val-dtype (pos? total-entries))
-        (let [vr (reify ObjectReader (lsize [_] total-entries)
-                   (readObject [_ idx] (let [v (aget flat-vals idx)] (if (nil? v) (long 0) v))))]
-          (write-column! arena val-data vr total-entries val-dtype (.address val-data)))))))
+        val-dtype (get duckdb-type->write-dtype val-type-kw)
+        ;; Flatten keys and values, write list entries
+        ^objects flat-keys (object-array total-entries)
+        ^objects flat-vals (object-array total-entries)
+        key-missing (RoaringBitmap.)
+        val-missing (RoaringBitmap.)]
+    (loop [i 0 offset 0]
+      (when (< i row-count)
+        (let [v (subcol i)
+              entry-off (long (* i 16))]
+          (if (and v (map? v))
+            (let [entries (seq v)
+                  n (count entries)]
+              (.set entry-seg ffi/VL-LONG entry-off (long offset))
+              (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
+              (loop [es entries j 0]
+                (when es
+                  (let [[k vv] (first es)
+                        ci (+ offset j)]
+                    (if (nil? k) (.add key-missing (int ci)) (aset flat-keys ci k))
+                    (if (nil? vv) (.add val-missing (int ci)) (aset flat-vals ci vv))
+                    (recur (next es) (unchecked-inc j)))))
+              (recur (unchecked-inc i) (+ offset n)))
+            (do
+              (.set entry-seg ffi/VL-LONG entry-off (long offset))
+              (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long 0))
+              (recur (unchecked-inc i) offset))))))
+    ;; Write key/value validity
+    (when (pos? total-entries)
+      (let [nw (long (Math/ceil (/ (double total-entries) 64)))]
+        (write-validity! (.reinterpret key-validity (* nw 8)) key-missing total-entries)
+        (write-validity! (.reinterpret val-validity (* nw 8)) val-missing total-entries)))
+    ;; Write key data
+    (when (and key-dtype (pos? total-entries))
+      (let [kr (reify ObjectReader (lsize [_] total-entries)
+                 (readObject [_ idx] (let [v (aget flat-keys idx)] (if (nil? v) "" v))))]
+        (write-column! arena key-data kr total-entries key-dtype (.address key-data))))
+    ;; Write value data
+    (when (and val-dtype (pos? total-entries))
+      (let [vr (reify ObjectReader (lsize [_] total-entries)
+                 (readObject [_ idx] (let [v (aget flat-vals idx)] (if (nil? v) (long 0) v))))]
+        (write-column! arena val-data vr total-entries val-dtype (.address val-data))))))
 
 ;; -- insert-dataset! --------------------------------------------------------
 
@@ -941,9 +940,9 @@
                       (MemorySegment/copy ptr-seg ffi/VL-BYTE (long 0) arr 0 slen)
                       (String. arr "UTF-8"))))))
             dt-proto/PClone
-            (clone [this]
+            (clone [_this]
               ;; Parallel decode via hamf/pgroups — each group works on a sub-range
-              (let [ne (long n-rows)
+              (let [ne n-rows
                     ^objects out (make-array String ne)]
                 (dorun
                  (hamf/pgroups ne
