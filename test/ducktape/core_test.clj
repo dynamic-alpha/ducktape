@@ -9,7 +9,7 @@
             [tech.v3.datatype.bitmap :as bitmap]
             [tech.v3.resource :as resource])
   (:import [java.util UUID]
-           [java.time LocalTime Instant]
+           [java.time Instant]
            [java.math BigDecimal BigInteger]))
 
 (duck/initialize!)
@@ -456,3 +456,182 @@
             (is (= {"a" 1 "b" 2} (first (r :data))))
             (is (= {"x" 10} (second (r :data))))
             (is (= #{2} (set (ds/missing r))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-chunk fast-path tests
+;;
+;; sql->dataset's :single result-type uses a partitioned parallel-memcpy
+;; concat fast-path when there are >=2 numeric/temporal columns and >=8
+;; chunks (~16K rows at DuckDB's default vector_size=2048).  These tests
+;; exercise the fast path on workloads large enough to trigger it, focusing
+;; on the corner cases that are easy to get wrong: missing-bitmap offset
+;; merging, packed-temporal type tagging, unsigned-int tagging, and
+;; numeric/non-numeric partition stitching.
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^:const fast-path-rows
+  "Comfortably above 8 chunks (8 * 2048 = 16384 rows minimum)."
+  20000)
+
+(deftest fast-path-numeric-with-nulls-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [n fast-path-rows
+            ;; Sprinkle nulls at non-uniform chunk offsets to exercise the
+            ;; per-chunk missing-bitmap offset merge across chunk boundaries.
+            null-rows #{0 1 100 2047 2048 2049 4097 (- n 1)}
+            longs (mapv (fn [i] (when-not (null-rows i) (long i)))   (range n))
+            doubles (mapv (fn [i] (when-not (null-rows i) (* i 1.5))) (range n))
+            ints (mapv (fn [i] (when-not (null-rows i) (int i)))     (range n))
+            floats (mapv (fn [i] (when-not (null-rows i) (float i))) (range n))
+            ds-in (-> (ds/->dataset {:longs longs :doubles doubles :ints ints :floats floats})
+                      (vary-meta assoc :name "fp_numeric_null"))]
+        (duck/create-table! cn ds-in)
+        (duck/insert-dataset! cn ds-in)
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_numeric_null ORDER BY longs NULLS LAST")
+              card (fn [^org.roaringbitmap.RoaringBitmap bm] (.getCardinality bm))]
+          (is (= n (ds/row-count out)))
+          ;; Missing rows should match the null count (positions differ post-ORDER BY,
+          ;; but cardinality must be preserved across the chunk-boundary union)
+          (is (= (count null-rows) (card (ds/missing (get out "longs"))))
+              "longs column missing-bitmap survived the chunk-boundary merge")
+          (is (= (count null-rows) (card (ds/missing (get out "doubles")))))
+          (is (= (count null-rows) (card (ds/missing (get out "ints")))))
+          (is (= (count null-rows) (card (ds/missing (get out "floats")))))
+          ;; Non-null values are intact — first non-null is at row index 2
+          ;; (rows 0 and 1 are in null-rows)
+          (is (= 2 (first (filter some? (get out "longs"))))))))))
+
+(deftest fast-path-mixed-partition-stitch-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [n fast-path-rows
+            ;; Column order: numeric, string, numeric, string, numeric.
+            ;; The stitch step must re-interleave numeric (fast-path) and
+            ;; string (fallback) columns back into this original positional order.
+            ds-in (-> (ds/->dataset {:a_long (long-array (range n))
+                                     :b_str  (mapv #(str "x" %) (range n))
+                                     :c_dbl  (double-array (map #(* 0.5 %) (range n)))
+                                     :d_str  (mapv #(str "y" %) (range n))
+                                     :e_int  (int-array (range n))})
+                      (vary-meta assoc :name "fp_mixed_order"))]
+        (duck/create-table! cn ds-in)
+        (duck/insert-dataset! cn ds-in)
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_mixed_order ORDER BY a_long")]
+          (is (= n (ds/row-count out)))
+          (is (= ["a_long" "b_str" "c_dbl" "d_str" "e_int"]
+                 (mapv (comp :name meta) (ds/columns out)))
+              "column order preserved after partition+stitch")
+          (is (= [0 1 2] (vec (take 3 (get out "a_long")))))
+          (is (= ["x0" "x1" "x2"] (vec (take 3 (get out "b_str")))))
+          (is (= [0.0 0.5 1.0] (vec (take 3 (get out "c_dbl")))))
+          (is (= ["y0" "y1" "y2"] (vec (take 3 (get out "d_str")))))
+          (is (= [0 1 2] (vec (take 3 (get out "e_int"))))))))))
+
+(deftest fast-path-wide-numeric-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [n fast-path-rows
+            base-date (java.time.LocalDate/of 2020 1 1)
+            ;; 8-column wide table: exercises the parallel pmap across many
+            ;; columns simultaneously plus a packed temporal type.
+            ds-in (-> (ds/->dataset {:l1 (long-array (range n))
+                                     :l2 (long-array (map #(* 2 %) (range n)))
+                                     :d1 (double-array (map #(* 0.5 %) (range n)))
+                                     :d2 (double-array (map #(* 1.5 %) (range n)))
+                                     :i1 (int-array (range n))
+                                     :i2 (int-array (map #(* 3 %) (range n)))
+                                     :f1 (float-array (map float (range n)))
+                                     :dt (mapv #(.plusDays base-date (long %)) (range n))})
+                      (vary-meta assoc :name "fp_wide_num"))]
+        (duck/create-table! cn ds-in)
+        (duck/insert-dataset! cn ds-in)
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_wide_num ORDER BY l1")]
+          (is (= n (ds/row-count out)))
+          (is (= 8 (ds/column-count out)))
+          (is (= 0 (first (get out "l1"))))
+          (is (= (long (* 2 (dec n))) (last (get out "l2"))))
+          (is (= 0.0 (first (get out "d1"))))
+          ;; Packed-local-date roundtrip — auto-unpacks to LocalDate on read
+          (is (= base-date (first (get out "dt"))))
+          (is (= (.plusDays base-date (dec n)) (last (get out "dt")))))))))
+
+(deftest fast-path-unsigned-types-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [n fast-path-rows]
+        (duck/run-query! cn "CREATE TABLE fp_unsigned (
+                               u8  UTINYINT,
+                               u16 USMALLINT,
+                               u32 UINTEGER,
+                               u64 UBIGINT,
+                               i64 BIGINT)")
+        (duck/run-query! cn
+                         (format "INSERT INTO fp_unsigned SELECT
+                                    (i %% 200)::UTINYINT,
+                                    (i %% 60000)::USMALLINT,
+                                    (i * 2)::UINTEGER,
+                                    (i * 3)::UBIGINT,
+                                    i::BIGINT
+                                  FROM range(0, %d) t(i)" n))
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_unsigned ORDER BY i64")]
+          (is (= n (ds/row-count out)))
+          (is (= :uint8  (dt/elemwise-datatype (get out "u8"))))
+          (is (= :uint16 (dt/elemwise-datatype (get out "u16"))))
+          (is (= :uint32 (dt/elemwise-datatype (get out "u32"))))
+          (is (= :uint64 (dt/elemwise-datatype (get out "u64"))))
+          ;; Spot-check round-trip values
+          (is (= 0 (long (first (get out "u8")))))
+          (is (= 199 (long (nth (get out "u8") 199))))
+          (is (= (long (* 2 (dec n))) (long (last (get out "u32")))))
+          (is (= (long (* 3 (dec n))) (long (last (get out "u64"))))))))))
+
+(deftest fast-path-packed-temporal-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [n fast-path-rows
+            base-date (java.time.LocalDate/of 2020 1 1)
+            base-time (java.time.LocalTime/of 10 30 0)
+            base-inst (java.time.Instant/parse "2020-01-01T10:00:00Z")
+            ds-in (-> (ds/->dataset
+                       {:id (long-array (range n))
+                        :d  (mapv #(.plusDays base-date (long %)) (range n))
+                        :t  (mapv #(.plusNanos base-time (long (* % 1000))) (range n))
+                        :i  (mapv #(.plusSeconds base-inst (long %)) (range n))})
+                      (vary-meta assoc :name "fp_temporal"))]
+        (duck/create-table! cn ds-in)
+        (duck/insert-dataset! cn ds-in)
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_temporal ORDER BY id")]
+          (is (= n (ds/row-count out)))
+          ;; All three packed types must auto-unpack on read
+          (is (= base-date (first (get out "d"))))
+          (is (= base-time (first (get out "t"))))
+          (is (= base-inst (first (get out "i"))))
+          (is (= (.plusDays base-date (dec n)) (last (get out "d"))))
+          (is (= (.plusSeconds base-inst (dec n)) (last (get out "i")))))))))
+
+(deftest fast-path-fallback-thresholds-test
+  ;; The fast path is gated on (>= n-numeric 2) AND (>= n-chunks 8).  Below
+  ;; either threshold the function falls back to apply ds/concat.  Both
+  ;; paths must produce equivalent datasets.
+  (with-fresh-conn
+    (fn [cn]
+      (testing "single numeric column — falls back, still correct"
+        (let [n fast-path-rows
+              ds-in (-> (ds/->dataset {:val (long-array (range n))})
+                        (vary-meta assoc :name "fp_single_col"))]
+          (duck/create-table! cn ds-in)
+          (duck/insert-dataset! cn ds-in)
+          (let [out (duck/sql->dataset cn "SELECT * FROM fp_single_col ORDER BY val")]
+            (is (= n (ds/row-count out)))
+            (is (= (vec (range n)) (vec (get out "val")))))))
+      (testing "small query (< 8 chunks) — falls back, still correct"
+        (let [n 100  ;; way below fast-path threshold
+              ds-in (-> (ds/->dataset {:a (long-array (range n))
+                                       :b (double-array (range n))})
+                        (vary-meta assoc :name "fp_small"))]
+          (duck/create-table! cn ds-in)
+          (duck/insert-dataset! cn ds-in)
+          (let [out (duck/sql->dataset cn "SELECT * FROM fp_small ORDER BY a")]
+            (is (= n (ds/row-count out)))
+            (is (= (vec (range n)) (vec (get out "a"))))))))))

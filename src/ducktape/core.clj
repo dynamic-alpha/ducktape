@@ -1433,13 +1433,149 @@
 
 ;; ---------------------------------------------------------------------------
 ;; 11. datasets->dataset
+;;
+;; Multi-chunk result materialization has historically been the dominant cost
+;; of sql->dataset on numeric workloads (~50–60% of wall-clock for 1M rows).
+;; The hot path is `apply ds/concat`, which is sequential per column.
+;;
+;; This namespace section implements a partitioned fast-path: when there are
+;; enough numeric/temporal columns and enough chunks for parallelism to pay
+;; for its FJP setup cost, columns are split by dtype.  The numeric subset is
+;; concatenated via per-column bulk memcpy into pre-sized heap arrays, run
+;; in parallel across cores via `hamf/pmap`.  Any non-numeric columns
+;; (strings, uuids, decimals, …) concurrently flow through the standard
+;; `apply ds/concat` path on a worker `future`.  Outputs are stitched back
+;; in the original column order.
+;;
+;; Falls back to plain `apply ds/concat` for small workloads (where parallel
+;; overhead would outweigh savings) or when fewer than two columns qualify.
 ;; ---------------------------------------------------------------------------
 
-(defn- datasets->dataset [^AutoCloseable results]
-  (let [dsdata (vec results)]
-    (if (== 1 (count dsdata))
-      (instr-time :concat-ns (dt/clone (dsdata 0)))
-      (instr-time :concat-ns (apply ds/concat dsdata)))))
+(def ^:private fast-concat-numeric-dtypes
+  "Dtypes for which the partitioned fast-path can concatenate via bulk memcpy
+  + dt/elemwise-cast tagging.  All other dtypes (strings, uuids, decimals,
+  lists, etc.) fall through to the standard apply ds/concat path."
+  #{:int8 :uint8 :int16 :uint16 :int32 :uint32 :int64 :uint64
+    :float32 :float64 :boolean
+    :packed-local-date :packed-local-time :packed-instant})
+
+(def ^:private dtype->storage-dtype
+  "Map logical dtype → underlying primitive-storage dtype.  Packed temporal
+  types and unsigned ints share storage with signed primitives.  Bulk copies
+  happen at the storage level (no per-element packing/unpacking dispatch),
+  while the target container is allocated at the logical dtype so reads
+  auto-unpack downstream."
+  {:int8 :int8, :uint8 :int8, :boolean :int8
+   :int16 :int16, :uint16 :int16
+   :int32 :int32, :uint32 :int32, :packed-local-date :int32
+   :int64 :int64, :uint64 :int64, :packed-local-time :int64, :packed-instant :int64
+   :float32 :float32
+   :float64 :float64})
+
+(defn- concat-numeric-col
+  "Concat one numeric/temporal column across `dsdata` chunks via bulk memcpy.
+
+  Allocates a heap container at the logical `dtype` (via
+  `dt/make-container :jvm-heap dtype total-rows`) so the resulting Buffer
+  unpacks correctly on read (LocalDate for :packed-local-date, etc.).
+
+  Each chunk's source NativeBuffer is re-tagged to the underlying storage
+  dtype before `dt/copy!`, which bypasses dtype-next's per-element
+  pack/unpack dispatch and lets the copy run as a primitive bulk move.
+
+  Per-chunk missing bitmaps are unioned with their offsets into a single
+  accumulator.
+
+  Note: `col-idx` and `total-rows` are taken as Object then cast inside the
+  body — Clojure's primitive-arg fn limit is 4, and we already pay 8 here."
+  [dsdata col-idx col-name col-meta dtype total-rows
+   ^longs row-counts ^longs offsets]
+  (let [col-idx (long col-idx)
+        total-rows (long total-rows)
+        n-chunks (count dsdata)
+        storage-dt (dtype->storage-dtype dtype)
+        target (dt/make-container :jvm-heap dtype total-rows)
+        missing-acc (bitmap/->bitmap)]
+    (dotimes [chunk-idx n-chunks]
+      (let [ds (dsdata chunk-idx)
+            ^Column col (nth (ds/columns ds) col-idx)
+            ;; Re-tag source NativeBuffer to storage dtype to bypass packing.
+            ;; The underlying native memory layout is unchanged; we just
+            ;; change how dt/copy! sees the element type.
+            src (native-buffer/set-native-datatype (.data col) storage-dt)
+            ^RoaringBitmap src-missing (.missing col)
+            n (aget row-counts chunk-idx)
+            off (aget offsets chunk-idx)]
+        (dt/copy! src (dt/sub-buffer target off n))
+        (when-not (.isEmpty src-missing)
+          (.or missing-acc ^RoaringBitmap (bitmap/offset src-missing off)))))
+    (ds/new-column col-name target col-meta missing-acc)))
+
+(defn- datasets->dataset
+  "Materialize a sequence of chunk Datasets into a single Dataset.
+
+  Fast-path activates when there are >=2 numeric/temporal columns and >=8
+  chunks (~16K rows at 2048/chunk).  Below that, the FJP startup cost
+  outweighs the savings; we fall back to `apply ds/concat`.  Single-chunk
+  results take the existing dt/clone shortcut."
+  [^AutoCloseable results]
+  (instr-time :concat-ns
+   (let [dsdata (vec results)
+         n-chunks (count dsdata)]
+     (cond
+       (empty? dsdata) nil
+       (== 1 n-chunks) (dt/clone (dsdata 0))
+       :else
+       (let [ds0 (dsdata 0)
+             cols0 (vec (ds/columns ds0))
+             n-cols (count cols0)
+             col-dtypes (mapv dt/elemwise-datatype cols0)
+             col-names (mapv (comp :name meta) cols0)
+             col-metas (mapv meta cols0)
+             numeric-idxs (filterv #(fast-concat-numeric-dtypes (col-dtypes %))
+                                   (range n-cols))
+             n-numeric (count numeric-idxs)]
+         (if (or (< n-numeric 2) (< n-chunks 8))
+           ;; Heuristic guards — not worth the parallel-dispatch overhead
+           (apply ds/concat dsdata)
+           (let [other-idxs (vec (remove (set numeric-idxs) (range n-cols)))
+                 n-other (count other-idxs)
+                 row-counts (long-array (map ds/row-count dsdata))
+                 total-rows (long (reduce + row-counts))
+                 ;; Cumulative offsets: offsets[i] = sum of row-counts[0..i-1]
+                 offsets (let [a (long-array (inc n-chunks))]
+                           (dotimes [i n-chunks]
+                             (aset a (inc i) (+ (aget a i) (aget row-counts i))))
+                           a)
+                 ;; Start non-numeric concat on a worker thread.  Overlaps the
+                 ;; non-numeric work with our numeric pmap; cheap insurance even
+                 ;; when the string concat dominates the critical path.
+                 other-cols-fut
+                 (when (pos? n-other)
+                   (future
+                     (let [other-names (mapv col-names other-idxs)
+                           projected (mapv #(ds/select-columns % other-names) dsdata)]
+                       (vec (ds/columns (apply ds/concat projected))))))
+                 ;; Parallel-memcpy each numeric column across cores
+                 numeric-cols
+                 (vec (hamf/pmap
+                       (fn [^long ni]
+                         (let [cidx (long (numeric-idxs ni))]
+                           (concat-numeric-col dsdata cidx
+                                               (col-names cidx) (col-metas cidx)
+                                               (col-dtypes cidx) total-rows
+                                               row-counts offsets)))
+                       (range n-numeric)))
+                 other-cols (when other-cols-fut @other-cols-fut)
+                 ;; Stitch numeric + other back into original column order
+                 numeric-pos (zipmap numeric-idxs (range))
+                 other-pos   (zipmap other-idxs   (range))
+                 merged-cols (mapv (fn [cidx]
+                                     (if-let [ni (numeric-pos cidx)]
+                                       (numeric-cols ni)
+                                       (other-cols (other-pos cidx))))
+                                   (range n-cols))]
+             (ds/new-dataset (ds/dataset-name ds0) merged-cols))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 12. Prepared statements

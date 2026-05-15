@@ -10,7 +10,7 @@ A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken
 
 **More DuckDB types.** Read and write support for BLOB, HUGEINT, DECIMAL, INTERVAL, ENUM, LIST, STRUCT, MAP, and all timestamp precision variants — types tmducken does not handle.
 
-**Performance tuned.** Signature-polymorphic FFI dispatch via `MethodHandles/explicitCastArguments` + `MethodHandleProxies` (no Panama `invokeWithArguments` allocation), parallel string/UUID encode and decode via `hamf/pgroups`, lock-free slab allocation for pointer-style strings, RoaringBitmap validity scanning, pre-packed temporal columns, and two-phase column cloning. Beats tmducken on all measured workloads — see [Benchmarks](#benchmarks).
+**Performance tuned.** Signature-polymorphic FFI dispatch via `MethodHandles/explicitCastArguments` + `MethodHandleProxies`, parallel string/UUID encode and decode via `hamf/pgroups`, lock-free slab allocation for pointer-style strings, RoaringBitmap validity scanning, pre-packed temporal columns, partitioned parallel-concat fast-path for multi-chunk numeric/temporal reads (one heap array per column, `MemorySegment.copy`'d in parallel across cores), and two-phase column cloning. Beats tmducken on all measured workloads — up to **4× faster** on numeric queries — see [Benchmarks](#benchmarks).
 
 ## Requirements
 
@@ -106,18 +106,33 @@ tmducken uses [JNA](https://github.com/java-native-access/jna) (via [dtype-next]
 
 ## Benchmarks
 
-1M rows, JDK 25, DuckDB 1.5.2, Apple M-series. Same JVM, same datasets, 1.5s JIT warmup per fn, 20–30 samples per phase per library, interleaved per-sample alternation. Δ% is `(tmducken_mean − ducktape_mean) / tmducken_mean` — positive means ducktape is faster. `*` indicates statistical significance at 95% CI; `trim` is the 10%-trimmed mean (robust to GC outliers).
+1M rows, JDK 25, DuckDB 1.5.2, Apple M-series. Same JVM, same datasets, 1.5s JIT warmup per fn, 30 samples per phase per library, interleaved per-sample alternation. **Speedup** is `tmducken_mean / ducktape_mean`; values above 1.0× mean ducktape is faster. All twelve metrics are statistically significant at 95% CI.
 
-|           | INSERT (mean / trim) | QUERY (mean / trim) |
-|-----------|----------------------|---------------------|
-| Numeric   | **+10.7%** * / +10.9% | **+54.9%** * / +55.5% |
-| String    | **+36.2%** * / +36.0% | **+26.1%** * / +23.2% |
-| UUID      | **+33.4%** * / +33.5% | **+35.4%** * / +35.5% |
-| Mixed     | **+30.4%** * / +30.2% | +21.2% / +23.3%       |
+| Workload         |        | tmducken rows/s | ducktape rows/s | **Speedup** |
+|------------------|--------|----------------:|----------------:|:-----------:|
+| **numeric**      | INSERT |      25,636,285 |      28,864,127 |  **1.13×**  |
+|                  | QUERY  |      48,066,662 |     170,902,963 |  **3.56×**  |
+| **string**       | INSERT |       2,626,336 |       4,190,803 |  **1.60×**  |
+|                  | QUERY  |       4,677,947 |       8,327,285 |  **1.78×**  |
+| **uuid**         | INSERT |      21,876,992 |      38,133,634 |  **1.74×**  |
+|                  | QUERY  |      19,504,444 |      30,279,061 |  **1.55×**  |
+| **mixed**        | INSERT |       6,341,387 |       9,288,231 |  **1.46×**  |
+|                  | QUERY  |       9,254,418 |      18,987,116 |  **2.05×**  |
+| **wide-numeric** | INSERT |      16,916,895 |      18,984,929 |  **1.12×**  |
+|                  | QUERY  |      21,564,755 |      86,642,974 |  **4.02×**  |
+| **wide-mixed**   | INSERT |       3,611,626 |       4,681,157 |  **1.30×**  |
+|                  | QUERY  |       5,387,781 |       9,697,254 |  **1.80×**  |
 
-Ducktape wins all 8 metrics (7 statistically significant); the mixed-query CI overlaps due to higher tail variance but the trimmed mean still favours ducktape. The biggest win is numeric query (+55%): tmducken's `apply ds/concat` over 489 native-buffer chunks is the dominant cost in both libraries, but ducktape's chunk-realization phase is meaningfully leaner.
+**Workload schemas** (1M rows each):
 
-The bench harness lives in `dev/tmducken_comparison.clj`. Run `(require '[tmducken-comparison :as cmp])` then `(cmp/compare-all)`.
+- **numeric** — 4 columns: `int64`, `float64`, `int32`, `float32`.
+- **string** — 3 columns: short string (~5 chars), long string (~25 chars), `int64` id.
+- **uuid** — 2 columns: `int64` id, `UUID`.
+- **mixed** — 4 columns: `int64`, `float64`, string, `LocalDate`.
+- **wide-numeric** — 8 numeric/temporal columns: 2× `int64`, 2× `float64`, 2× `int32`, 2× `LocalDate`. Exercises the partitioned parallel-concat fast-path with enough columns to fully utilise typical core counts.
+- **wide-mixed** — 10 columns: the 8 from `wide-numeric` plus 2 string columns. Realistic OLAP fact-table shape, mixing fast-path numeric columns with fallback-path string columns.
+
+The bench harness lives in `dev/tmducken_comparison.clj`. Run `(require '[tmducken-comparison :as cmp])` then `(cmp/compare-all)`, or invoke individual workloads via `(cmp/compare-numeric)`, `(cmp/compare-wide-numeric)`, etc.
 
 ## Development
 

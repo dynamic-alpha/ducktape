@@ -3,11 +3,13 @@
 
   Usage from REPL:
     (require '[tmducken-comparison :as cmp] :reload)
-    (cmp/compare-all)        ; full suite
-    (cmp/compare-uuid)       ; just UUID
-    (cmp/compare-string)     ; just string
-    (cmp/compare-numeric)    ; just numeric
-    (cmp/compare-mixed)      ; just mixed
+    (cmp/compare-all)            ; full suite
+    (cmp/compare-uuid)           ; just UUID
+    (cmp/compare-string)         ; just string
+    (cmp/compare-numeric)        ; just numeric
+    (cmp/compare-mixed)          ; just mixed
+    (cmp/compare-wide-numeric)   ; 8-column all-numeric (exercises pmap)
+    (cmp/compare-wide-mixed)     ; 8 numeric + 2 string
 
   IMPORTANT: only call ONE compare-* at a time. Running concurrently makes
   results unreliable since both libraries compete for CPU/memory bandwidth.
@@ -58,6 +60,38 @@
                        :strings (mapv #(str "str" (rem % 9999)) (range n))
                        :dates (mapv #(.plusDays base-date (long (rem % 3650))) (range n))})
         (vary-meta assoc :name "bench_mixed"))))
+
+(defn make-wide-numeric
+  "8-column all-numeric/temporal table.  Exercises the partitioned fast-path's
+  parallel pmap across enough columns to fully utilise typical core counts."
+  [n]
+  (let [base-date (LocalDate/of 2000 1 1)]
+    (-> (ds/->dataset {:l1 (long-array (range n))
+                       :l2 (long-array (map #(* 2 %) (range n)))
+                       :d1 (double-array (map #(* % 1.234) (range n)))
+                       :d2 (double-array (map #(* % 5.678) (range n)))
+                       :i1 (int-array (range n))
+                       :i2 (int-array (map #(* 3 %) (range n)))
+                       :dt1 (mapv #(.plusDays base-date (long (rem % 3650))) (range n))
+                       :dt2 (mapv #(.plusDays base-date (long (rem % 1825))) (range n))})
+        (vary-meta assoc :name "bench_wide_numeric"))))
+
+(defn make-wide-mixed
+  "10-column table: 8 numeric/temporal + 2 string.  Tests the partition+stitch
+  path on a realistic OLAP-style fact table shape."
+  [n]
+  (let [base-date (LocalDate/of 2000 1 1)]
+    (-> (ds/->dataset {:l1 (long-array (range n))
+                       :l2 (long-array (map #(* 2 %) (range n)))
+                       :d1 (double-array (map #(* % 1.234) (range n)))
+                       :d2 (double-array (map #(* % 5.678) (range n)))
+                       :i1 (int-array (range n))
+                       :i2 (int-array (map #(* 3 %) (range n)))
+                       :dt1 (mapv #(.plusDays base-date (long (rem % 3650))) (range n))
+                       :dt2 (mapv #(.plusDays base-date (long (rem % 1825))) (range n))
+                       :s1 (mapv #(str "x" (rem % 9999)) (range n))
+                       :s2 (mapv #(str "y" (rem % 9999)) (range n))})
+        (vary-meta assoc :name "bench_wide_mixed"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Init — connections lazily started on first use, cached for reuse
@@ -296,6 +330,14 @@
   ([] (compare-mixed {}))
   ([opts] (compare-workload "mixed" make-mixed opts)))
 
+(defn compare-wide-numeric
+  ([] (compare-wide-numeric {}))
+  ([opts] (compare-workload "wide-numeric" make-wide-numeric opts)))
+
+(defn compare-wide-mixed
+  ([] (compare-wide-mixed {}))
+  ([opts] (compare-workload "wide-mixed" make-wide-mixed opts)))
+
 (defn compare-all
   "Run all workloads sequentially. Returns a vector of result maps."
   ([] (compare-all {}))
@@ -310,15 +352,17 @@
    (let [results [(compare-numeric opts)
                   (compare-string opts)
                   (compare-uuid opts)
-                  (compare-mixed opts)]]
+                  (compare-mixed opts)
+                  (compare-wide-numeric opts)
+                  (compare-wide-mixed opts)]]
      (println "\n═══════════════════════════════════════════════════════")
      (println " Summary  (Δ % = ducktape vs tmducken; + = duck faster)")
      (println " mean = arithmetic mean; trim = 10%-trimmed mean (robust to GC outliers)")
      (println "═══════════════════════════════════════════════════════")
-     (println (format "  %-8s  %-22s  %-22s" "" "INSERT" "QUERY"))
-     (println (format "  %-8s  %-22s  %-22s" "" "mean / trim" "mean / trim"))
+     (println (format "  %-13s  %-22s  %-22s" "" "INSERT" "QUERY"))
+     (println (format "  %-13s  %-22s  %-22s" "" "mean / trim" "mean / trim"))
      (doseq [r results]
-       (println (format "  %-8s  %+5.1f%% %s / %+5.1f%%       %+5.1f%% %s / %+5.1f%%"
+       (println (format "  %-13s  %+5.1f%% %s / %+5.1f%%       %+5.1f%% %s / %+5.1f%%"
                         (:label r)
                         (:pct (:insert r)) (if (:sig? (:insert r)) "*" " ")
                         (:trim-pct (:insert r))
