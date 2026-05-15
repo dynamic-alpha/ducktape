@@ -85,24 +85,37 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private duckdb-types
-  '{DUCKDB_TYPE_INVALID    0
-    DUCKDB_TYPE_BOOLEAN    1
-    DUCKDB_TYPE_TINYINT    2
-    DUCKDB_TYPE_SMALLINT   3
-    DUCKDB_TYPE_INTEGER    4
-    DUCKDB_TYPE_BIGINT     5
-    DUCKDB_TYPE_UTINYINT   6
-    DUCKDB_TYPE_USMALLINT  7
-    DUCKDB_TYPE_UINTEGER   8
-    DUCKDB_TYPE_UBIGINT    9
-    DUCKDB_TYPE_FLOAT     10
-    DUCKDB_TYPE_DOUBLE    11
-    DUCKDB_TYPE_TIMESTAMP 12
-    DUCKDB_TYPE_DATE      13
-    DUCKDB_TYPE_TIME      14
-    DUCKDB_TYPE_HUGEINT   16
-    DUCKDB_TYPE_VARCHAR   17
-    DUCKDB_TYPE_UUID      27})
+  '{DUCKDB_TYPE_INVALID      0
+    DUCKDB_TYPE_BOOLEAN      1
+    DUCKDB_TYPE_TINYINT      2
+    DUCKDB_TYPE_SMALLINT     3
+    DUCKDB_TYPE_INTEGER      4
+    DUCKDB_TYPE_BIGINT       5
+    DUCKDB_TYPE_UTINYINT     6
+    DUCKDB_TYPE_USMALLINT    7
+    DUCKDB_TYPE_UINTEGER     8
+    DUCKDB_TYPE_UBIGINT      9
+    DUCKDB_TYPE_FLOAT       10
+    DUCKDB_TYPE_DOUBLE      11
+    DUCKDB_TYPE_TIMESTAMP   12
+    DUCKDB_TYPE_DATE        13
+    DUCKDB_TYPE_TIME        14
+    DUCKDB_TYPE_INTERVAL    15
+    DUCKDB_TYPE_HUGEINT     16
+    DUCKDB_TYPE_VARCHAR     17
+    DUCKDB_TYPE_BLOB        18
+    DUCKDB_TYPE_DECIMAL     19
+    DUCKDB_TYPE_TIMESTAMP_S  20
+    DUCKDB_TYPE_TIMESTAMP_MS 21
+    DUCKDB_TYPE_TIMESTAMP_NS 22
+    DUCKDB_TYPE_ENUM        23
+    DUCKDB_TYPE_LIST        24
+    DUCKDB_TYPE_STRUCT      25
+    DUCKDB_TYPE_MAP         26
+    DUCKDB_TYPE_UUID        27
+    DUCKDB_TYPE_UNION       28
+    DUCKDB_TYPE_TIMESTAMP_TZ 31
+    DUCKDB_TYPE_ARRAY       33})
 
 (defmacro ^:private define-type-constants! []
   `(do ~@(for [[sym val] duckdb-types]
@@ -255,7 +268,36 @@
    ["duckdb_bind_date"          :int  [:addr :long :int]         :int]
    ["duckdb_bind_time"          :int  [:addr :long :long]        :int]
    ["duckdb_bind_timestamp"     :int  [:addr :long :long]        :int]
-   ["duckdb_bind_varchar_length" :int [:addr :long :addr :long]  :int]])
+   ["duckdb_bind_varchar_length" :int [:addr :long :addr :long]  :int]
+   ;; Logical type introspection — DECIMAL
+   ["duckdb_decimal_internal_type" :int  [:addr]              :int]
+   ["duckdb_decimal_scale"         :int  [:addr]              :int]
+   ["duckdb_decimal_width"         :int  [:addr]              :int]
+   ;; Logical type introspection — ENUM
+   ["duckdb_enum_internal_type"    :int  [:addr]              :int]
+   ["duckdb_enum_dictionary_size"  :int  [:addr]              :int]
+   ["duckdb_enum_dictionary_value" :addr [:addr :long]        nil]
+   ["duckdb_create_enum_type"      :addr [:addr :long]        nil]
+   ;; Logical type introspection — LIST
+   ["duckdb_list_vector_get_child" :addr [:addr]              nil]
+   ["duckdb_list_vector_get_size"  :long [:addr]              :long]
+   ["duckdb_list_vector_set_size"  :int  [:addr :long]        :int]
+   ["duckdb_list_type_child_type"  :addr [:addr]              nil]
+   ["duckdb_create_list_type"      :addr [:addr]              nil]
+   ;; Logical type introspection — STRUCT
+   ["duckdb_struct_type_child_count" :long [:addr]            :long]
+   ["duckdb_struct_type_child_name"  :addr [:addr :long]      nil]
+   ["duckdb_struct_type_child_type"  :addr [:addr :long]      nil]
+   ["duckdb_struct_vector_get_child" :addr [:addr :long]      nil]
+   ["duckdb_create_struct_type"      :addr [:addr :addr :long] nil]
+   ;; Logical type introspection — ARRAY
+   ["duckdb_array_type_child_type"   :addr [:addr]            nil]
+   ["duckdb_array_vector_get_child"  :addr [:addr]            nil]
+   ["duckdb_array_type_array_size"   :long [:addr]            :long]
+   ["duckdb_create_array_type"       :addr [:addr :long]      nil]
+   ;; Appender column introspection
+   ["duckdb_appender_column_type"    :addr [:addr :long]      nil]
+   ["duckdb_appender_column_count"   :long [:addr]            :long]])
 
 ;; ---------------------------------------------------------------------------
 ;; Helper functions
