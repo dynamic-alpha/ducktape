@@ -10,6 +10,8 @@ A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken
 
 **More DuckDB types.** Read and write support for BLOB, HUGEINT, DECIMAL, INTERVAL, ENUM, LIST, STRUCT, MAP, and all timestamp precision variants — types tmducken does not handle.
 
+**Streaming appender API.** `open-appender` / `append-dataset!` / `flush-appender!` expose DuckDB's appender as a long-lived, reusable writer. Schema setup — appender create, column-type probe, data chunk + logical type allocation — is paid once and amortized across every batch fed through it. Up to **10× faster** than repeated `insert-dataset!` calls for streaming ingest workloads with small batches (see [Streaming inserts](#streaming-inserts-appender-vs-many-one-shot-inserts)). tmducken has no equivalent.
+
 **Performance tuned.** Signature-polymorphic FFI dispatch via `MethodHandles/explicitCastArguments` + `MethodHandleProxies`, parallel string/UUID encode and decode via `hamf/pgroups`, lock-free slab allocation for pointer-style strings, RoaringBitmap validity scanning, pre-packed temporal columns, partitioned parallel-concat fast-path for multi-chunk numeric/temporal reads (one heap array per column, `MemorySegment.copy`'d in parallel across cores), and two-phase column cloning. Beats tmducken on all measured workloads — up to **4× faster** on numeric queries — see [Benchmarks](#benchmarks).
 
 ## Requirements
@@ -52,6 +54,29 @@ A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken
 (duck/close-db db)
 ```
 
+## Streaming inserts
+
+For producers that feed the database many small batches (Kafka consumers,
+paginated API ingest, file shards), use the stateful appender API to
+amortize DuckDB's per-call setup costs across batches:
+
+```clojure
+(with-open [app (duck/open-appender conn sample-ds)]
+  (doseq [batch dataset-stream]
+    (duck/append-dataset! app batch))
+  ;; close flushes; or call (duck/flush-appender! app) for explicit
+  ;; commit points if you need bounded data-loss windows.
+  )
+```
+
+`sample-ds` is a `tech.v3.dataset` whose column dtypes (and `:name`
+metadata) define the schema every batch must match. Multiple appenders
+can be open simultaneously on the same connection — typically one per
+destination table.
+
+See [Benchmarks](#benchmarks) for a quantitative comparison vs repeated
+`insert-dataset!` calls (up to **10×** faster for tiny batches).
+
 ## API
 
 | Function | Description |
@@ -62,6 +87,7 @@ A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken
 | `run-query!` | Execute SQL, ignore results (DDL, DML) |
 | `create-table!` / `drop-table!` | Create/drop a table from a dataset schema |
 | `insert-dataset!` | Bulk insert via DuckDB's data chunk appender API |
+| `open-appender` / `append-dataset!` / `flush-appender!` | Long-lived streaming appender — amortizes setup across many batches |
 | `sql->dataset` | Query → single dataset |
 | `sql->datasets` | Query → lazy sequence of chunk datasets |
 | `prepare` | Prepared statement (0-arity, 1-arity, or N-arity) |
@@ -133,6 +159,34 @@ tmducken uses [JNA](https://github.com/java-native-access/jna) (via [dtype-next]
 - **wide-mixed** — 10 columns: the 8 from `wide-numeric` plus 2 string columns. Realistic OLAP fact-table shape, mixing fast-path numeric columns with fallback-path string columns.
 
 The bench harness lives in `dev/tmducken_comparison.clj`. Run `(require '[tmducken-comparison :as cmp])` then `(cmp/compare-all)`, or invoke individual workloads via `(cmp/compare-numeric)`, `(cmp/compare-wide-numeric)`, etc.
+
+### Streaming inserts: appender vs many one-shot inserts
+
+The streaming `open-appender` / `append-dataset!` API amortizes the per-call
+DuckDB FFI setup (appender create/destroy, column-type probe, data chunk
+allocation, logical type creation/destruction) across many batches. Below,
+**100k total rows** split into varying numbers of batches; each cell is
+`speedup-mean × / trimmed-mean ×` for `insert-dataset! ÷ appender`.
+
+| Workload    | 10 batches × 10k rows | 100 batches × 1k rows | 1000 batches × 100 rows | 10000 batches × 10 rows |
+|-------------|----------------------:|----------------------:|------------------------:|------------------------:|
+| **numeric** | 1.15× / 1.27×         | **2.75×** \* / 2.98×  | **8.94×** \* / 9.14×    | **10.62×** \* / 10.54×  |
+| **string**  | **1.09×** \* / 1.09×  | **1.53×** \* / 1.54×  | **4.82×** \* / 4.81×    | **9.19×** \* / 9.20×    |
+| **mixed**   | **1.23×** \* / 1.18×  | **2.05×** \* / 2.01×  | **6.03×** \* / 6.12×    | **8.27×** \* / 9.28×    |
+
+`*` = statistically significant at 95% CI on the mean. Same JVM (JDK 25,
+DuckDB 1.5.2, Apple M-series), 1.5s warmup per fn, 30 interleaved samples.
+
+The amortization scales with batch frequency. At 10 × 10k-row batches there
+is little setup to amortize and per-batch encoding work dominates (1.1–1.3×).
+At 10000 × 10-row batches the per-batch setup overhead dominates the
+`insert-dataset!` path, so the streaming API wins by roughly an order of
+magnitude. Numeric workloads see the largest relative gains because the
+actual encoding work is cheapest, making setup overhead proportionally larger.
+
+The bench harness lives in `dev/appender_comparison.clj`. Run
+`(require '[appender-comparison :as ac])` then `(ac/compare-all)`, or
+`(ac/compare-streaming :string 100000 1000)` for a single configuration.
 
 ## Development
 

@@ -635,3 +635,244 @@
           (let [out (duck/sql->dataset cn "SELECT * FROM fp_small ORDER BY a")]
             (is (= n (ds/row-count out)))
             (is (= (vec (range n)) (vec (get out "a"))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Streaming appender API tests
+;; ---------------------------------------------------------------------------
+
+(defn- make-stream-ds
+  "Build a small batch with a stable schema for streaming tests.
+  `n` must be >= 1 — element-dtypes can't be inferred from empty seqs.
+  Pass the same table-name across batches to feed one appender."
+  [table-name start n]
+  (assert (>= n 1) "make-stream-ds requires at least 1 row for stable dtypes")
+  (-> (ds/->dataset {:id (long-array (range start (+ start n)))
+                     :name (mapv #(str "row-" %) (range start (+ start n)))
+                     :score (double-array (map #(* 0.5 %) (range start (+ start n))))})
+      (vary-meta assoc :name table-name)))
+
+(defn- stream-schema-sample
+  "A 1-row schema sample for `make-stream-ds`-shaped tables."
+  [table-name]
+  (make-stream-ds table-name 0 1))
+
+(deftest appender-basic-lifecycle-test
+  (testing "open + multiple appends + close round-trips correctly"
+    (with-fresh-conn
+      (fn [cn]
+        (let [sample (stream-schema-sample "stream_basic")]
+          (duck/create-table! cn sample)
+          ;; Drop the schema sample's row so we get a clean count
+          (duck/run-query! cn "DELETE FROM stream_basic")
+          (with-open [app (duck/open-appender cn sample)]
+            (let [r1 (duck/append-dataset! app (make-stream-ds "stream_basic" 0 10))
+                  r2 (duck/append-dataset! app (make-stream-ds "stream_basic" 10 5))
+                  r3 (duck/append-dataset! app (make-stream-ds "stream_basic" 15 25))]
+              (is (= 10 r1))
+              (is (= 5 r2))
+              (is (= 25 r3))))
+          ;; close should have flushed
+          (let [r (duck/sql->dataset cn "SELECT * FROM stream_basic ORDER BY id" {:key-fn keyword})]
+            (is (= 40 (ds/row-count r)))
+            (is (= (vec (range 40)) (vec (r :id))))
+            (is (= (mapv #(str "row-" %) (range 40)) (vec (r :name))))
+            (is (= (mapv #(* 0.5 %) (range 40)) (vec (r :score))))))))))
+
+(deftest appender-many-small-batches-test
+  ;; The whole point of the streaming API: many tiny batches reuse the
+  ;; appender's cached schema state and produce a correct table.
+  (testing "100 × 7-row batches via one appender"
+    (with-fresh-conn
+      (fn [cn]
+        (let [sample (stream-schema-sample "stream_many")]
+          (duck/create-table! cn sample)
+          (duck/run-query! cn "DELETE FROM stream_many")
+          (with-open [app (duck/open-appender cn sample)]
+            (dotimes [i 100]
+              (duck/append-dataset! app (make-stream-ds "stream_many" (* i 7) 7))))
+          (let [r (duck/sql->dataset cn "SELECT * FROM stream_many ORDER BY id" {:key-fn keyword})]
+            (is (= 700 (ds/row-count r)))
+            (is (= (vec (range 700)) (vec (r :id))))))))))
+
+(deftest appender-flush-makes-rows-visible-test
+  ;; Rows held in the appender's internal buffer are NOT visible. Calling
+  ;; flush-appender! makes them visible mid-stream.
+  (testing "buffered rows invisible until flush"
+    (with-fresh-conn
+      (fn [cn]
+        (let [sample (stream-schema-sample "stream_flush")
+              count-rows #(first ((duck/sql->dataset cn "SELECT count(*) AS n FROM stream_flush"
+                                                    {:key-fn keyword}) :n))]
+          (duck/create-table! cn sample)
+          (duck/run-query! cn "DELETE FROM stream_flush")
+          (with-open [app (duck/open-appender cn sample)]
+            (is (= 0 (count-rows)) "no rows before any append")
+            (duck/append-dataset! app (make-stream-ds "stream_flush" 0 50))
+            (is (= 0 (count-rows)) "appended rows still buffered, not visible")
+            (is (= :ok (duck/flush-appender! app)))
+            (is (= 50 (count-rows)) "flush makes buffered rows visible")
+            ;; flushing again with nothing buffered is a no-op
+            (is (= :ok (duck/flush-appender! app)))
+            (is (= 50 (count-rows)))))))))
+
+(deftest appender-multiple-open-simultaneously-test
+  ;; The whole "single worker, N tables" use case.
+  (testing "two appenders open in parallel on the same connection write to different tables"
+    (with-fresh-conn
+      (fn [cn]
+        (let [sample-a (stream-schema-sample "stream_multi_a")
+              sample-b (-> (ds/->dataset {:label ["x"] :weight (float-array [1.0])})
+                           (vary-meta assoc :name "stream_multi_b"))]
+          (duck/create-table! cn sample-a)
+          (duck/create-table! cn sample-b)
+          (duck/run-query! cn "DELETE FROM stream_multi_a")
+          (with-open [app-a (duck/open-appender cn sample-a)
+                      app-b (duck/open-appender cn sample-b)]
+            (dotimes [i 5]
+              (duck/append-dataset! app-a (make-stream-ds "stream_multi_a" (* i 3) 3))
+              (duck/append-dataset! app-b (-> (ds/->dataset
+                                               {:label (mapv #(str "l-" %) (range (* i 2) (+ (* i 2) 2)))
+                                                :weight (float-array (map #(* 0.25 %)
+                                                                          (range (* i 2) (+ (* i 2) 2))))})
+                                              (vary-meta assoc :name "stream_multi_b")))))
+          (let [ra (duck/sql->dataset cn "SELECT * FROM stream_multi_a ORDER BY id" {:key-fn keyword})
+                rb (duck/sql->dataset cn "SELECT * FROM stream_multi_b ORDER BY label" {:key-fn keyword})]
+            (is (= 15 (ds/row-count ra)))
+            (is (= (vec (range 15)) (vec (ra :id))))
+            ;; create-table! only creates schema (no insert), so rb has only the 10 we appended.
+            (is (= 10 (ds/row-count rb)))
+            (is (= (sort (map #(str "l-" %) (range 10)))
+                   (vec (rb :label))))))))))
+
+(deftest appender-schema-mismatch-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [sample (stream-schema-sample "stream_sm")]
+        (duck/create-table! cn sample)
+        (duck/run-query! cn "DELETE FROM stream_sm")
+        (with-open [app (duck/open-appender cn sample)]
+          (testing "extra column rejected"
+            (let [bad (-> (ds/->dataset {:id (long-array [0])
+                                         :name ["x"]
+                                         :score (double-array [0.0])
+                                         :extra (long-array [1])})
+                          (vary-meta assoc :name "stream_sm"))]
+              (is (thrown-with-msg? IllegalArgumentException
+                                    #"Batch schema does not match"
+                                    (duck/append-dataset! app bad)))))
+          (testing "missing column rejected"
+            (let [bad (-> (ds/->dataset {:id (long-array [0])
+                                         :name ["x"]})
+                          (vary-meta assoc :name "stream_sm"))]
+              (is (thrown-with-msg? IllegalArgumentException
+                                    #"Batch schema does not match"
+                                    (duck/append-dataset! app bad)))))
+          (testing "wrong dtype rejected"
+            (let [bad (-> (ds/->dataset {:id (long-array [0])
+                                         :name ["x"]
+                                         :score (long-array [0])}) ;; int instead of double
+                          (vary-meta assoc :name "stream_sm"))]
+              (is (thrown-with-msg? IllegalArgumentException
+                                    #"Batch schema does not match"
+                                    (duck/append-dataset! app bad)))))
+          (testing "matching batch still works after rejected ones"
+            (is (= 3 (duck/append-dataset! app (make-stream-ds "stream_sm" 0 3))))))))))
+
+(deftest appender-closed-throws-test
+  (with-fresh-conn
+    (fn [cn]
+      (let [sample (stream-schema-sample "stream_closed")
+            _ (duck/create-table! cn sample)
+            _ (duck/run-query! cn "DELETE FROM stream_closed")
+            app (duck/open-appender cn sample)]
+        (duck/append-dataset! app (make-stream-ds "stream_closed" 0 2))
+        (.close ^java.lang.AutoCloseable app)
+        (is (thrown-with-msg? IllegalStateException
+                              #"Appender is closed"
+                              (duck/append-dataset! app (make-stream-ds "stream_closed" 2 2))))
+        (is (thrown-with-msg? IllegalStateException
+                              #"Appender is closed"
+                              (duck/flush-appender! app)))
+        ;; double-close is safe (CAS protects against double-destroy)
+        (.close ^java.lang.AutoCloseable app)
+        ;; rows from before close should still be there
+        (let [r (duck/sql->dataset cn "SELECT count(*) AS n FROM stream_closed"
+                                   {:key-fn keyword})]
+          (is (= 2 (first (r :n)))))))))
+
+(deftest appender-poisoned-by-failed-flush-test
+  ;; Constraint violation at flush time invalidates buffered data and
+  ;; poisons the appender. close-after-poison must be a safe no-op
+  ;; (the failed flush already destroyed the native state).
+  (with-fresh-conn
+    (fn [cn]
+      (duck/run-query! cn "CREATE TABLE stream_pk (id INTEGER PRIMARY KEY, v VARCHAR)")
+      (let [batch-1 (-> (ds/->dataset {:id (int-array [1 2]) :v ["a" "b"]})
+                        (vary-meta assoc :name "stream_pk"))
+            dup (-> (ds/->dataset {:id (int-array [1]) :v ["x"]})
+                    (vary-meta assoc :name "stream_pk"))
+            app (duck/open-appender cn batch-1)]
+        (try
+          ;; First batch commits cleanly.
+          (duck/append-dataset! app batch-1)
+          (is (= :ok (duck/flush-appender! app)))
+          ;; Duplicate key — flush fails, appender becomes poisoned.
+          (duck/append-dataset! app dup)
+          (is (thrown-with-msg? Exception
+                                #"flush failed.*[Dd]uplicate"
+                                (duck/flush-appender! app)))
+          ;; Subsequent ops fail fast.
+          (is (thrown-with-msg? IllegalStateException
+                                #"Appender is closed"
+                                (duck/append-dataset! app batch-1)))
+          (is (thrown-with-msg? IllegalStateException
+                                #"Appender is closed"
+                                (duck/flush-appender! app)))
+          ;; The first batch's data survived (it was committed by the first flush).
+          (let [r (duck/sql->dataset cn "SELECT count(*) AS n FROM stream_pk"
+                                     {:key-fn keyword})]
+            (is (= 2 (first (r :n)))))
+          (finally
+            ;; close-after-poison must not throw or double-destroy
+            (try (.close ^java.lang.AutoCloseable app)
+                 (catch Throwable t
+                   (is false (str "close-after-poison threw: " t))))))))))
+
+(deftest appender-equivalence-with-insert-dataset-test
+  ;; Same input dataset, two write paths, identical output table.
+  (with-fresh-conn
+    (fn [cn]
+      (duck/run-query! cn "CREATE TABLE eq_insert (id BIGINT, name VARCHAR, score DOUBLE)")
+      (duck/run-query! cn "CREATE TABLE eq_appender (id BIGINT, name VARCHAR, score DOUBLE)")
+      (let [batches (vec (for [i (range 5)] (make-stream-ds "_" (* i 20) 20)))]
+        ;; insert-dataset! path
+        (doseq [b batches]
+          (duck/insert-dataset! cn (vary-meta b assoc :name "eq_insert")))
+        ;; open-appender path
+        (with-open [app (duck/open-appender cn (vary-meta (first batches) assoc :name "eq_appender"))]
+          (doseq [b batches]
+            (duck/append-dataset! app (vary-meta b assoc :name "eq_appender"))))
+        (let [r1 (duck/sql->dataset cn "SELECT * FROM eq_insert   ORDER BY id" {:key-fn keyword})
+              r2 (duck/sql->dataset cn "SELECT * FROM eq_appender ORDER BY id" {:key-fn keyword})]
+          (is (= (ds/row-count r1) (ds/row-count r2)))
+          (is (= (vec (r1 :id))    (vec (r2 :id))))
+          (is (= (vec (r1 :name))  (vec (r2 :name))))
+          (is (= (vec (r1 :score)) (vec (r2 :score)))))))))
+
+(deftest appender-handles-special-types-test
+  ;; The shared helpers must cover the same type matrix as insert-dataset!.
+  ;; Spot-check string + UUID + instant via the streaming API.
+  (with-fresh-conn
+    (fn [cn]
+      (let [base (-> (ds/->dataset {:s   (mapv #(str "v-" %) (range 5))
+                                    :uid (repeatedly 5 #(UUID/randomUUID))
+                                    :t   (repeatedly 5 #(java.time.Instant/now))})
+                     (vary-meta assoc :name "stream_special"))]
+        (duck/create-table! cn base)
+        (with-open [app (duck/open-appender cn base)]
+          (duck/append-dataset! app base)
+          (duck/append-dataset! app base)
+          (duck/append-dataset! app base))
+        (let [r (duck/sql->dataset cn "SELECT count(*) AS n FROM stream_special"
+                                   {:key-fn keyword})]
+          (is (= 15 (first (r :n)))))))))

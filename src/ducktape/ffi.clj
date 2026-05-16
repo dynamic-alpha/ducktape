@@ -349,6 +349,7 @@
    ["duckdb_appender_create"    :int  [:addr :addr :addr :addr]  :int]
    ["duckdb_appender_destroy"   :int  [:addr]                    :int]
    ["duckdb_appender_error"     :addr [:addr]                    nil]
+   ["duckdb_appender_flush"     :int  [:addr]                    :int]
    ["duckdb_append_data_chunk"  :int  [:addr :addr]              :int]
    ["duckdb_vector_size"        :long []                         :long]
    ["duckdb_create_data_chunk"  :addr [:addr :long]              nil]

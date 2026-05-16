@@ -12,7 +12,7 @@
   (:import [java.lang.foreign Arena MemoryLayout MemorySegment]
            [java.math BigInteger BigDecimal]
            [java.util UUID]
-           [java.util.concurrent.atomic LongAdder]
+           [java.util.concurrent.atomic AtomicBoolean LongAdder]
            [java.util.function Supplier]
            [java.time LocalDate LocalTime Instant]
            [ham_fisted ITypedReduce IFnDef]
@@ -639,198 +639,368 @@
                  (readObject [_ idx] (let [v (aget flat-vals idx)] (if (nil? v) (long 0) v))))]
         (write-column! arena val-data vr total-entries val-dtype (.address val-data))))))
 
+;; -- Shared helpers for one-shot insert and streaming appender -------------
+
+(defn- probe-col-overrides
+  "Probe each appender column's logical type, returning a map of
+  `{col-idx -> {:kw :lt ...}}` only for columns that need special-case
+  write handling (ENUM, STRUCT, LIST, MAP, DECIMAL, INTERVAL, HUGEINT,
+  BLOB, non-default-precision TIMESTAMP variants).
+
+  Logical-type handles in the returned map are *retained* and must be
+  destroyed at appender teardown. Logical types we don't need are freed
+  here."
+  [^MemorySegment appender ^long n-cols]
+  (reduce
+   (fn [m ci]
+     (let [^MemorySegment lt (ffi/duckdb_appender_column_type appender (long ci))
+           tid (ffi/duckdb_get_type_id lt)
+           kw  (get ffi/duckdb-type-map tid)]
+       (case kw
+         :DUCKDB_TYPE_ENUM
+         (let [dict-size (ffi/duckdb_enum_dictionary_size lt)
+               dict (mapv (fn [i]
+                            (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
+                                  v (ffi/read-c-str s)]
+                              (ffi/duckdb_free s) v))
+                          (range dict-size))
+               dict-reverse (into {} (map-indexed (fn [i v] [v i]) dict))
+               internal-kw (get ffi/duckdb-type-map (ffi/duckdb_enum_internal_type lt))]
+           (assoc m ci {:kw kw :lt lt :dict-reverse dict-reverse :internal-kw internal-kw}))
+         :DUCKDB_TYPE_STRUCT
+         (let [n (ffi/duckdb_struct_type_child_count lt)
+               child-names (mapv (fn [i]
+                                   (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
+                                         v (ffi/read-c-str s)]
+                                     (ffi/duckdb_free s) v))
+                                 (range n))
+               child-type-ids (mapv (fn [i]
+                                      (let [^MemorySegment clt (ffi/duckdb_struct_type_child_type lt (long i))
+                                            tid (ffi/duckdb_get_type_id clt)]
+                                        (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type clt)
+                                        tid))
+                                    (range n))]
+           (assoc m ci {:kw kw :lt lt :child-names child-names :child-type-ids child-type-ids}))
+         (:DUCKDB_TYPE_TIMESTAMP_TZ :DUCKDB_TYPE_TIMESTAMP_S :DUCKDB_TYPE_TIMESTAMP_MS :DUCKDB_TYPE_TIMESTAMP_NS)
+         (assoc m ci {:kw kw :lt lt})
+         :DUCKDB_TYPE_BLOB
+         (assoc m ci {:kw kw :lt lt})
+         :DUCKDB_TYPE_HUGEINT
+         (assoc m ci {:kw kw :lt lt})
+         :DUCKDB_TYPE_INTERVAL
+         (assoc m ci {:kw kw :lt lt})
+         :DUCKDB_TYPE_DECIMAL
+         (let [scale-val (ffi/duckdb_decimal_scale lt)
+               width-val (ffi/duckdb_decimal_width lt)
+               internal-type (ffi/duckdb_decimal_internal_type lt)
+               internal-kw (get ffi/duckdb-type-map internal-type)]
+           (assoc m ci {:kw kw :lt lt :scale scale-val :width width-val :internal-kw internal-kw}))
+         :DUCKDB_TYPE_LIST
+         (let [^MemorySegment child-lt (ffi/duckdb_list_type_child_type lt)
+               child-tid (ffi/duckdb_get_type_id child-lt)
+               child-info {:type-id child-tid}]
+           (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
+           (assoc m ci {:kw kw :lt lt :child-type child-info}))
+         :DUCKDB_TYPE_MAP
+         ;; MAP is LIST<STRUCT{key, value}> — extract key/value types
+         (let [^MemorySegment list-child-lt (ffi/duckdb_list_type_child_type lt)
+               ^MemorySegment key-lt (ffi/duckdb_struct_type_child_type list-child-lt 0)
+               ^MemorySegment val-lt (ffi/duckdb_struct_type_child_type list-child-lt 1)
+               key-info {:type-id (ffi/duckdb_get_type_id key-lt)}
+               val-info {:type-id (ffi/duckdb_get_type_id val-lt)}]
+           (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type key-lt)
+           (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type val-lt)
+           (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type list-child-lt)
+           (assoc m ci {:kw kw :lt lt :key-type key-info :val-type val-info}))
+         ;; Non-special type — destroy and skip
+         (do (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type lt)
+             m))))
+   {} (range n-cols)))
+
+(defn- setup-appender-state!
+  "Open a DuckDB appender on `table-name` and build all schema-derived
+  state needed to feed batches into it: the data chunk, vector handles,
+  retained logical types, per-column overrides, and the dataset dtypes.
+
+  Returned state owns native resources. Caller is responsible for invoking
+  `destroy-appender-state!`. On partial failure inside this fn (e.g. the
+  data chunk fails to allocate) the appender is destroyed before re-throwing."
+  [^long conn ^String table-name schema-dataset]
+  (with-open [setup-arena (Arena/ofConfined)]
+    (let [conn-seg (MemorySegment/ofAddress conn)
+          app-ptr  (.allocate setup-arena ffi/VL-ADDR)
+          app-rc   (ffi/duckdb_appender_create conn-seg
+                                               (ffi/alloc-c-str setup-arena "")
+                                               (ffi/alloc-c-str setup-arena table-name)
+                                               app-ptr)
+          ^MemorySegment appender (.get app-ptr ffi/VL-ADDR 0)]
+      (when-not (== (int app-rc) ffi/DuckDBSuccess)
+        (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
+          (try (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
+               (catch Throwable _))
+          (throw (Exception. (str "Appender create error: " err)))))
+      (try
+        (let [n-cols       (ds/column-count schema-dataset)
+              colvec       (vec (ds/columns schema-dataset))
+              dtypes       (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
+              duckdb-ids   (mapv dtype->duckdb-type dtypes)
+              ;; Only probe appender column types when dataset has columns
+              ;; that may need special handling. Pure numeric/temporal/uuid
+              ;; datasets skip all probe FFI calls.
+              needs-probe? (some (fn [ci]
+                                   (let [dt (dtypes ci)]
+                                     (or (nil? (duckdb-ids ci))
+                                         (= dt :string))))
+                                 (range n-cols))
+              col-overrides (if needs-probe?
+                              (probe-col-overrides appender n-cols)
+                              {})
+              types-seg (.allocate setup-arena (* n-cols 8))
+              _ (dotimes [ci n-cols]
+                  (if-let [ovr (get col-overrides ci)]
+                    ;; Use appender's logical type (e.g. ENUM, DECIMAL)
+                    (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
+                    ;; Normal: create from dataset dtype
+                    (.set types-seg ffi/VL-ADDR (long (* ci 8))
+                          ^MemorySegment (ffi/duckdb_create_logical_type (int (duckdb-ids ci))))))
+              ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
+              ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
+              vecs (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %))
+                                      (range n-cols)))
+              ;; Extract logical-type addresses so we don't need types-seg later.
+              ;; (The arena holding types-seg closes when this fn returns.)
+              logical-types (mapv (fn [ci] (.get types-seg ffi/VL-ADDR (long (* ci 8))))
+                                  (range n-cols))]
+          {:appender      appender
+           :write-chunk   write-chunk
+           :vecs          vecs
+           :dtypes        dtypes
+           :col-overrides col-overrides
+           :logical-types logical-types
+           :table-name    table-name})
+        (catch Throwable t
+          (try (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
+               (catch Throwable _))
+          (throw t))))))
+
+(defn- destroy-appender-state!
+  "Release all native resources held by an appender state map."
+  [state]
+  (let [{:keys [appender write-chunk logical-types]} state]
+    (ffi/destroy-ptrs!
+     (concat [[ffi/duckdb_appender_destroy appender]
+              [ffi/duckdb_destroy_data_chunk write-chunk]]
+             (map (fn [lt] [ffi/duckdb_destroy_logical_type lt]) logical-types)))))
+
+(defn- write-dataset-chunks!
+  "Write the rows of `dataset` into the cached data chunk + appender in
+  `state`. `arena` is a per-batch arena used for VARCHAR/BLOB slab
+  allocations and must be `Arena/ofShared` so parallel string/blob writes
+  via hamf/pgroups can access it from fork-join threads.
+
+  Returns the number of rows written."
+  [^Arena arena state dataset]
+  (let [{:keys [^MemorySegment appender ^MemorySegment write-chunk
+                ^objects vecs dtypes col-overrides]} state
+        n-cols      (count dtypes)
+        check-error (fn [status]
+                      (when-not (== (int status) ffi/DuckDBSuccess)
+                        (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
+                          (throw (Exception. (str "Appender error: " err))))))
+        n-rows      (ds/row-count dataset)
+        colvec      (vec (ds/columns dataset))
+        chunk-size  (ffi/duckdb_vector_size)
+        n-chunks    (long (Math/ceil (/ (double n-rows) chunk-size)))
+        ;; Pre-pack temporal columns once (not per-chunk)
+        prepped-cols (object-array
+                      (map-indexed
+                       (fn [ci col]
+                         (let [dt (dtypes ci)]
+                           (if (#{:local-date :local-time :instant} dt)
+                             (packing/pack col)
+                             col)))
+                       colvec))
+        ;; Pre-resolve full-column missing bitmaps (avoid per-chunk ds/missing)
+        ^objects full-missings (object-array (map ds/missing colvec))]
+    (dotimes [chunk-idx n-chunks]
+      (let [row-off   (long (* chunk-idx chunk-size))
+            row-count (long (min chunk-size (- n-rows row-off)))]
+        (ffi/duckdb_data_chunk_set_size write-chunk row-count)
+        (dotimes [col-idx n-cols]
+          (let [^MemorySegment dvec (aget vecs col-idx)
+                _                   (ffi/duckdb_vector_ensure_validity_writable dvec)
+                ^MemorySegment dp   (ffi/duckdb_vector_get_data dvec)
+                ^MemorySegment vp   (ffi/duckdb_vector_get_validity dvec)
+                col-dt  (dtypes col-idx)
+                ;; Clip full-column missing bitmap to this chunk's range
+                ^RoaringBitmap full-missing (aget full-missings col-idx)
+                chunk-missing (if (.isEmpty full-missing)
+                                full-missing
+                                (let [bm (RoaringBitmap/bitmapOfRange row-off (+ row-off row-count))]
+                                  (.and bm full-missing)
+                                  ;; Shift to 0-based for this chunk
+                                  (RoaringBitmap/addOffset bm (- row-off))))
+                subcol  (dt/sub-buffer (aget prepped-cols col-idx) row-off row-count)]
+            (write-validity! (.reinterpret vp (* (long (Math/ceil (/ (double row-count) 64))) 8))
+                             chunk-missing
+                             row-count)
+            (if-let [ovr (get col-overrides col-idx)]
+              ;; Special column type
+              (case (:kw ovr)
+                :DUCKDB_TYPE_ENUM
+                (write-enum! dp subcol row-count (:dict-reverse ovr) (:internal-kw ovr))
+                :DUCKDB_TYPE_STRUCT
+                (write-struct! arena dvec subcol row-count (:child-names ovr) (:child-type-ids ovr))
+                :DUCKDB_TYPE_TIMESTAMP_TZ
+                (write-timestamp-converted! dp subcol row-count :micros)
+                :DUCKDB_TYPE_TIMESTAMP_S
+                (write-timestamp-converted! dp subcol row-count :seconds)
+                :DUCKDB_TYPE_TIMESTAMP_MS
+                (write-timestamp-converted! dp subcol row-count :millis)
+                :DUCKDB_TYPE_TIMESTAMP_NS
+                (write-timestamp-converted! dp subcol row-count :nanos)
+                :DUCKDB_TYPE_BLOB
+                (write-blob! arena dp subcol row-count)
+                :DUCKDB_TYPE_HUGEINT
+                (write-hugeint! dp subcol row-count)
+                :DUCKDB_TYPE_INTERVAL
+                (write-interval! dp subcol row-count)
+                :DUCKDB_TYPE_DECIMAL
+                (write-decimal! dp subcol row-count (:scale ovr) (:internal-kw ovr))
+                :DUCKDB_TYPE_LIST
+                (write-list! arena dvec subcol row-count (:child-type ovr))
+                :DUCKDB_TYPE_MAP
+                (write-map! arena dvec subcol row-count (:key-type ovr) (:val-type ovr)))
+              ;; Normal column
+              (write-column! arena dp subcol row-count
+                             (if (#{:local-date :local-time :instant} col-dt)
+                               (keyword (str "packed-" (name col-dt)))
+                               col-dt)
+                             (.address dp)))))
+        (check-error (ffi/duckdb_append_data_chunk appender write-chunk))
+        (ffi/duckdb_data_chunk_reset write-chunk)))
+    n-rows))
+
 ;; -- insert-dataset! --------------------------------------------------------
 
 (defn insert-dataset!
+  "Bulk-insert `dataset` into the table named by its `:name` metadata (or
+  `(:table-name options)`). Internally opens a fresh appender, writes one
+  batch, and closes — paying schema setup costs once per call.
+
+  For streaming workloads with many batches of the same schema, prefer
+  `open-appender` + `append-dataset!` to amortize that setup cost across
+  batches.
+
+  Returns the number of rows written."
   ([^long conn dataset options]
-   ;; ofShared: allows parallel string/uuid writes from hamf/pgroups fork-join threads
-   (with-open [arena (Arena/ofShared)]
-     (let [table-name (sql/table-name dataset options)
-           conn-seg   (MemorySegment/ofAddress conn)
-           app-ptr    (.allocate arena ffi/VL-ADDR)
-           app-rc     (ffi/duckdb_appender_create conn-seg
-                                                  (ffi/alloc-c-str arena "")
-                                                  (ffi/alloc-c-str arena table-name)
-                                                  app-ptr)
-           ^MemorySegment appender (.get app-ptr ffi/VL-ADDR 0)
-           check-error (fn [status]
-                         (when-not (== (int status) ffi/DuckDBSuccess)
-                           (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
-                             (throw (Exception. (str "Appender error: " err))))))
-           _          (check-error app-rc)
-           n-rows     (ds/row-count dataset)
-           n-cols     (ds/column-count dataset)
-           colvec     (vec (ds/columns dataset))
-           dtypes     (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
-           duckdb-ids (mapv dtype->duckdb-type dtypes)
-           chunk-size (ffi/duckdb_vector_size)
-           n-chunks   (long (Math/ceil (/ (double n-rows) chunk-size)))
-           ;; Only probe appender column types when dataset has columns that
-           ;; may need special handling. String columns could be ENUM, object
-           ;; columns could be BLOB/HUGEINT/DECIMAL/INTERVAL/LIST/MAP/STRUCT.
-           ;; Pure numeric/temporal/uuid datasets skip all probe FFI calls.
-           needs-probe? (some (fn [ci]
-                                (let [dt (dtypes ci)]
-                                  (or (nil? (duckdb-ids ci))
-                                      (= dt :string))))
-                              (range n-cols))
-           col-overrides
-           (if-not needs-probe?
-             {}
-             (reduce (fn [m ci]
-                       (let [^MemorySegment lt (ffi/duckdb_appender_column_type appender (long ci))
-                             tid (ffi/duckdb_get_type_id lt)
-                             kw (get ffi/duckdb-type-map tid)]
-                         (case kw
-                           :DUCKDB_TYPE_ENUM
-                           (let [dict-size (ffi/duckdb_enum_dictionary_size lt)
-                                 dict (mapv (fn [i]
-                                              (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
-                                                    v (ffi/read-c-str s)]
-                                                (ffi/duckdb_free s) v))
-                                            (range dict-size))
-                                 dict-reverse (into {} (map-indexed (fn [i v] [v i]) dict))
-                                 internal-kw (get ffi/duckdb-type-map (ffi/duckdb_enum_internal_type lt))]
-                             (assoc m ci {:kw kw :lt lt :dict-reverse dict-reverse :internal-kw internal-kw}))
-                           :DUCKDB_TYPE_STRUCT
-                           (let [n (ffi/duckdb_struct_type_child_count lt)
-                                 child-names (mapv (fn [i]
-                                                     (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
-                                                           v (ffi/read-c-str s)]
-                                                       (ffi/duckdb_free s) v))
-                                                   (range n))
-                                 child-type-ids (mapv (fn [i]
-                                                        (let [^MemorySegment clt (ffi/duckdb_struct_type_child_type lt (long i))
-                                                              tid (ffi/duckdb_get_type_id clt)]
-                                                          (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type clt)
-                                                          tid))
-                                                      (range n))]
-                             (assoc m ci {:kw kw :lt lt :child-names child-names :child-type-ids child-type-ids}))
-                           (:DUCKDB_TYPE_TIMESTAMP_TZ :DUCKDB_TYPE_TIMESTAMP_S :DUCKDB_TYPE_TIMESTAMP_MS :DUCKDB_TYPE_TIMESTAMP_NS)
-                           (assoc m ci {:kw kw :lt lt})
-                           :DUCKDB_TYPE_BLOB
-                           (assoc m ci {:kw kw :lt lt})
-                           :DUCKDB_TYPE_HUGEINT
-                           (assoc m ci {:kw kw :lt lt})
-                           :DUCKDB_TYPE_INTERVAL
-                           (assoc m ci {:kw kw :lt lt})
-                           :DUCKDB_TYPE_DECIMAL
-                           (let [scale-val (ffi/duckdb_decimal_scale lt)
-                                 width-val (ffi/duckdb_decimal_width lt)
-                                 internal-type (ffi/duckdb_decimal_internal_type lt)
-                                 internal-kw (get ffi/duckdb-type-map internal-type)]
-                             (assoc m ci {:kw kw :lt lt :scale scale-val :width width-val :internal-kw internal-kw}))
-                           :DUCKDB_TYPE_LIST
-                           (let [^MemorySegment child-lt (ffi/duckdb_list_type_child_type lt)
-                                 child-tid (ffi/duckdb_get_type_id child-lt)
-                                 child-info {:type-id child-tid}]
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
-                             (assoc m ci {:kw kw :lt lt :child-type child-info}))
-                           :DUCKDB_TYPE_MAP
-                         ;; MAP is LIST<STRUCT{key, value}> — extract key/value types
-                           (let [^MemorySegment list-child-lt (ffi/duckdb_list_type_child_type lt)
-                               ;; list-child is STRUCT{key, value}
-                                 ^MemorySegment key-lt (ffi/duckdb_struct_type_child_type list-child-lt 0)
-                                 ^MemorySegment val-lt (ffi/duckdb_struct_type_child_type list-child-lt 1)
-                                 key-info {:type-id (ffi/duckdb_get_type_id key-lt)}
-                                 val-info {:type-id (ffi/duckdb_get_type_id val-lt)}]
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type key-lt)
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type val-lt)
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type list-child-lt)
-                             (assoc m ci {:kw kw :lt lt :key-type key-info :val-type val-info}))
-                         ;; Non-special type — destroy and skip
-                           (do (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type lt)
-                               m))))
-                     {} (range n-cols)))
-           types-seg  (.allocate arena (* n-cols 8))
-           _          (dotimes [ci n-cols]
-                        (if-let [ovr (get col-overrides ci)]
-                          ;; Use appender's logical type (e.g. ENUM)
-                          (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
-                          ;; Normal: create from dataset dtype
-                          (.set types-seg ffi/VL-ADDR (long (* ci 8))
-                                ^MemorySegment (ffi/duckdb_create_logical_type (int (duckdb-ids ci))))))
-           ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
-           ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
-           vecs  (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %)) (range n-cols)))
-           ;; Pre-pack temporal columns once (not per-chunk)
-           prepped-cols (object-array
-                         (map-indexed
-                          (fn [ci col]
-                            (let [dt (dtypes ci)]
-                              (if (#{:local-date :local-time :instant} dt)
-                                (packing/pack col)
-                                col)))
-                          colvec))
-           ;; Pre-resolve full-column missing bitmaps (avoid per-chunk ds/missing)
-           ^objects full-missings (object-array (map ds/missing colvec))]
-       (try
-         (dotimes [chunk-idx n-chunks]
-           (let [row-off   (long (* chunk-idx chunk-size))
-                 row-count (long (min chunk-size (- n-rows row-off)))]
-             (ffi/duckdb_data_chunk_set_size write-chunk row-count)
-             (dotimes [col-idx n-cols]
-               (let [^MemorySegment dvec (aget vecs col-idx)
-                     _                   (ffi/duckdb_vector_ensure_validity_writable dvec)
-                     ^MemorySegment dp   (ffi/duckdb_vector_get_data dvec)
-                     ^MemorySegment vp   (ffi/duckdb_vector_get_validity dvec)
-                     col-dt  (dtypes col-idx)
-                     ;; Clip full-column missing bitmap to this chunk's range
-                     ^RoaringBitmap full-missing (aget full-missings col-idx)
-                     chunk-missing (if (.isEmpty full-missing)
-                                     full-missing
-                                     (let [bm (RoaringBitmap/bitmapOfRange row-off (+ row-off row-count))]
-                                       (.and bm full-missing)
-                                       ;; Shift to 0-based for this chunk
-                                       (RoaringBitmap/addOffset bm (- row-off))))
-                     subcol  (dt/sub-buffer (aget prepped-cols col-idx) row-off row-count)]
-                 (write-validity! (.reinterpret vp (* (long (Math/ceil (/ (double row-count) 64))) 8))
-                                  chunk-missing
-                                  row-count)
-                 (if-let [ovr (get col-overrides col-idx)]
-                   ;; Special column type
-                   (case (:kw ovr)
-                     :DUCKDB_TYPE_ENUM
-                     (write-enum! dp subcol row-count (:dict-reverse ovr) (:internal-kw ovr))
-                     :DUCKDB_TYPE_STRUCT
-                     (write-struct! arena dvec subcol row-count (:child-names ovr) (:child-type-ids ovr))
-                     :DUCKDB_TYPE_TIMESTAMP_TZ
-                     (write-timestamp-converted! dp subcol row-count :micros)
-                     :DUCKDB_TYPE_TIMESTAMP_S
-                     (write-timestamp-converted! dp subcol row-count :seconds)
-                     :DUCKDB_TYPE_TIMESTAMP_MS
-                     (write-timestamp-converted! dp subcol row-count :millis)
-                     :DUCKDB_TYPE_TIMESTAMP_NS
-                     (write-timestamp-converted! dp subcol row-count :nanos)
-                     :DUCKDB_TYPE_BLOB
-                     (write-blob! arena dp subcol row-count)
-                     :DUCKDB_TYPE_HUGEINT
-                     (write-hugeint! dp subcol row-count)
-                     :DUCKDB_TYPE_INTERVAL
-                     (write-interval! dp subcol row-count)
-                     :DUCKDB_TYPE_DECIMAL
-                     (write-decimal! dp subcol row-count (:scale ovr) (:internal-kw ovr))
-                     :DUCKDB_TYPE_LIST
-                     (write-list! arena dvec subcol row-count (:child-type ovr))
-                     :DUCKDB_TYPE_MAP
-                     (write-map! arena dvec subcol row-count (:key-type ovr) (:val-type ovr)))
-                   ;; Normal column
-                   (write-column! arena dp subcol row-count
-                                  (if (#{:local-date :local-time :instant} col-dt)
-                                    (keyword (str "packed-" (name col-dt)))
-                                    col-dt)
-                                  (.address dp)))))
-             (check-error (ffi/duckdb_append_data_chunk appender write-chunk))
-             (ffi/duckdb_data_chunk_reset write-chunk)))
-         n-rows
-         (finally
-           (ffi/destroy-ptrs!
-            (concat [[ffi/duckdb_appender_destroy appender]
-                     [ffi/duckdb_destroy_data_chunk write-chunk]]
-                    (map (fn [ci] [ffi/duckdb_destroy_logical_type
-                                   (.get types-seg ffi/VL-ADDR (long (* ci 8)))])
-                         (range n-cols)))))))))
+   (let [table-name (sql/table-name dataset options)
+         state      (setup-appender-state! conn table-name dataset)]
+     (try
+       ;; ofShared: allows parallel string/uuid writes from hamf/pgroups fork-join threads
+       (with-open [arena (Arena/ofShared)]
+         (write-dataset-chunks! arena state dataset))
+       (finally
+         (destroy-appender-state! state)))))
   ([conn dataset] (insert-dataset! conn dataset nil)))
+
+;; ---------------------------------------------------------------------------
+;; 7c. Appender — long-lived, reusable streaming writer
+;; ---------------------------------------------------------------------------
+
+(deftype Appender [state ^AtomicBoolean closed?]
+  AutoCloseable
+  (close [_]
+    (when (.compareAndSet closed? false true)
+      (destroy-appender-state! state)))
+  Object
+  (toString [_]
+    (str "#duckdb-appender[\"" (:table-name state) "\""
+         (when (.get closed?) " :closed") "]")))
+
+(defn- check-appender-open! [^Appender app]
+  (when (.get ^AtomicBoolean (.-closed? app))
+    (throw (IllegalStateException.
+            "Appender is closed (or was poisoned by a failed flush)."))))
+
+(defn open-appender
+  "Open a long-lived appender for `schema-dataset`'s table on `conn`.
+
+  The appender caches schema-derived state — column dtypes, DuckDB
+  logical types, and the underlying data chunk buffer — across many
+  `append-dataset!` calls, avoiding the per-call setup overhead of
+  `insert-dataset!`. This is the right choice when a producer streams
+  many batches of the same shape into the same table.
+
+  `schema-dataset` is a sample `tech.v3.dataset` whose column dtypes
+  define the schema every batch fed through this appender must conform
+  to. The table name is read from `(sql/table-name schema-dataset options)`,
+  with `(:table-name options)` taking precedence.
+
+  Returns an `AutoCloseable` `Appender`. Closing flushes any rows still
+  buffered inside DuckDB; use `with-open` for the typical lifetime:
+
+    (with-open [app (duck/open-appender conn sample-ds)]
+      (doseq [batch dataset-stream]
+        (duck/append-dataset! app batch)))
+
+  Multiple appenders may be open simultaneously on the same connection
+  (e.g. one per destination table). An `Appender` is not thread-safe and
+  must be used only by the thread that owns its connection."
+  (^AutoCloseable [conn schema-dataset]
+   (open-appender conn schema-dataset nil))
+  (^AutoCloseable [^long conn schema-dataset options]
+   (let [table-name (sql/table-name schema-dataset options)
+         state      (setup-appender-state! conn table-name schema-dataset)]
+     (->Appender state (AtomicBoolean. false)))))
+
+(defn append-dataset!
+  "Append `dataset` to the open `appender`. `dataset` must have the same
+  column dtypes (in the same order) as the schema sample passed to
+  `open-appender`.
+
+  Returns the number of rows appended.
+
+  Throws `IllegalStateException` if the appender has been closed, or
+  `IllegalArgumentException` if the dataset schema does not match."
+  [^Appender appender dataset]
+  (check-appender-open! appender)
+  (let [state           (.-state appender)
+        expected-dtypes (:dtypes state)
+        batch-dtypes    (mapv (comp packing/unpack-datatype dt/elemwise-datatype)
+                              (ds/columns dataset))]
+    (when-not (= batch-dtypes expected-dtypes)
+      (throw (IllegalArgumentException.
+              (str "Batch schema does not match appender schema for table \""
+                   (:table-name state) "\". Expected dtypes "
+                   expected-dtypes " but got " batch-dtypes "."))))
+    (with-open [arena (Arena/ofShared)]
+      (write-dataset-chunks! arena state dataset))))
+
+(defn flush-appender!
+  "Flush the appender's internal DuckDB buffer, committing buffered rows
+  so they become visible to other connections.
+
+  Constraint violations (PK, UNIQUE, etc.) surface at flush time. A
+  failed flush invalidates all data buffered in the appender — DuckDB
+  cannot recover the partially-written batch — so this fn additionally
+  poisons the appender on failure: native resources are released and
+  subsequent operations throw `IllegalStateException`. Close (a safe
+  no-op after poisoning) and open a fresh appender to recover.
+
+  Returns `:ok` on success."
+  [^Appender appender]
+  (check-appender-open! appender)
+  (let [state (.-state appender)
+        ^MemorySegment app (:appender state)
+        rc    (ffi/duckdb_appender_flush app)]
+    (when-not (== (int rc) ffi/DuckDBSuccess)
+      (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app))]
+        ;; Poison: destroy state exactly once (CAS in close() will then no-op).
+        (when (.compareAndSet ^AtomicBoolean (.-closed? appender) false true)
+          (try (destroy-appender-state! state) (catch Throwable _)))
+        (throw (Exception. (str "Appender flush failed: " err)))))
+    :ok))
 
 ;; ---------------------------------------------------------------------------
 ;; 7b. Read-path instrumentation (dev-only, off by default; zero overhead off)
