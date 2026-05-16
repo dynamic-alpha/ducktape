@@ -34,7 +34,18 @@ faster** than tmducken (see [Benchmarks](#benchmarks)).
 - **JDK 22+** (Panama FFM is a final API as of JDK 22)
 - **DuckDB 1.5+** (tested against 1.5.2)
 
-> `--enable-native-access=ALL-UNNAMED` must be passed as a JVM option.
+## Installation
+
+Add the dependency and the required JVM option to your `deps.edn`:
+
+```clojure
+{:deps {ai.dyal/ducktape {:mvn/version "0.1.0-SNAPSHOT"}}
+ :aliases
+ {:dev {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
+```
+
+The `--enable-native-access=ALL-UNNAMED` JVM option is required — Panama's
+FFI refuses native downcalls without it.
 
 ## Quick start
 
@@ -215,13 +226,9 @@ nix develop
 
 ### deps.edn
 
-```clojure
-{:deps  {ai.dyal/ducktape {:mvn/version "0.1.0-SNAPSHOT"}}
- :aliases
- {:dev {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
-```
-
-Snapshots are published to Clojars; nothing else needs to be configured.
+See [Installation](#installation) for the dependency coordinate and required
+JVM option. Snapshots are published to Clojars; nothing else needs to be
+configured.
 
 ## Releasing
 
