@@ -21,6 +21,8 @@
             jdk
             clojure
             pkgs.duckdb
+            pkgs.clj-kondo
+            pkgs.cljfmt
           ];
           shellHook = ''
             export DUCKDB_HOME="${pkgs.duckdb.lib}/lib"

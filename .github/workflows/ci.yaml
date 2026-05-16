@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref when a new run starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      # Required by magic-nix-cache-action to talk to the new GitHub Actions
+      # cache API on behalf of the workflow.
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Stick to upstream Nix for now (Determinate is the default since
+          # late 2025). Drop this line if/when we want Determinate Nix.
+          determinate: false
+          extra-conf: |
+            substituters = https://cache.nixos.org https://nix-community.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=
+
+      # Caches /nix/store builds across runs via the GitHub Actions cache.
+      # The official action was deprecated in early 2025 but revived in
+      # June 2025 once the new GH Actions cache API was reverse-engineered,
+      # so no fork is needed any more.
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Caches Clojure dependency artifacts (Maven jars, git deps, deps.clj
+      # cache). Re-keyed whenever deps.edn changes.
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+            .cpcache
+          key: ${{ runner.os }}-cljdeps-${{ hashFiles('deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-cljdeps-
+
+      # Realises the dev shell once so subsequent steps reuse the same
+      # /nix/store paths (and the cache picks them up).
+      - name: Build dev shell
+        run: nix develop --command bash -c "echo 'dev shell ready'"
+
+      - name: Lint (clj-kondo)
+        run: nix develop --command clj-kondo --lint src test
+
+      - name: Format (cljfmt)
+        run: nix develop --command cljfmt check
+
+      - name: Run tests
+        run: nix develop --command clojure -M:test

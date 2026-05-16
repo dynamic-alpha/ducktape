@@ -1,5 +1,7 @@
 # Ducktape
 
+[![CI](https://github.com/dynamic-alpha/ducktape/actions/workflows/ci.yaml/badge.svg)](https://github.com/dynamic-alpha/ducktape/actions/workflows/ci.yaml)
+
 Connect [tech.v3.dataset](https://github.com/techascent/tech.ml.dataset) to [DuckDB](https://duckdb.org).
 
 A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken) that uses Java's [Panama Foreign Function & Memory API](https://openjdk.org/jeps/454) instead of JNA.
