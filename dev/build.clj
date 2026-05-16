@@ -17,7 +17,8 @@
     CLOJARS_PASSWORD — a Clojars deploy token (NOT your account password).
                        Create one at https://clojars.org/tokens and scope it
                        to ai.dyal/* for least-privilege."
-  (:require [clojure.tools.build.api :as b]
+  (:require [clojure.string :as str]
+            [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib              'ai.dyal/ducktape)
@@ -34,6 +35,22 @@
 (defn- jar-file [version]
   (format "target/%s-%s.jar" (name lib) version))
 
+(defn- scm-tag
+  "Resolve the value for the pom's <scm><tag>.
+
+  For tagged releases (non-SNAPSHOT) we use the conventional `v<version>` tag —
+  the Release workflow pushes that tag, so cljdoc can clone the repo at the
+  exact source published to Clojars.
+
+  For SNAPSHOT builds there is no matching tag in git, so we fall back to the
+  current commit SHA. That keeps the <scm> block resolvable on every deploy
+  (cljdoc otherwise reports SCM info as broken/missing when the tag 404s on
+  GitHub)."
+  [version]
+  (if (str/ends-with? version "-SNAPSHOT")
+    (b/git-process {:git-args "rev-parse HEAD"})
+    (str "v" version)))
+
 (defn- pom-data [version]
   [[:description "DuckDB bindings for tech.ml.dataset via Java Panama FFM."]
    [:url         github-url]
@@ -48,7 +65,7 @@
     [:url                 github-url]
     [:connection          "scm:git:https://github.com/dynamic-alpha/ducktape.git"]
     [:developerConnection "scm:git:ssh://git@github.com/dynamic-alpha/ducktape.git"]
-    [:tag                 (str "v" version)]]])
+    [:tag                 (scm-tag version)]]])
 
 (defn clean
   "Remove the build output directory."
