@@ -19,36 +19,36 @@ jobs:
     timeout-minutes: 20
 
     permissions:
-      # Required by magic-nix-cache-action to talk to the new GitHub Actions
-      # cache API on behalf of the workflow.
-      id-token: write
       contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Single-user Nix install — designed for CI, ~5s vs ~30s for the
+      # Determinate installer, and pairs cleanly with cache-nix-action
+      # (which can't restore root-owned /nix from multi-user mode).
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: nixbuild/nix-quick-install-action@v29
         with:
-          # Stick to upstream Nix for now (Determinate is the default since
-          # late 2025). Drop this line if/when we want Determinate Nix.
-          determinate: false
-          extra-conf: |
+          nix_conf: |
+            experimental-features = nix-command flakes
             substituters = https://cache.nixos.org https://nix-community.cachix.org
             trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=
 
-      # Caches /nix/store builds across runs via the GitHub Actions cache.
-      # The official action was deprecated in early 2025 but revived in
-      # June 2025 once the new GH Actions cache API was reverse-engineered,
-      # so no fork is needed any more.
-      - name: Enable Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
+      # Caches /nix/store across runs, keyed on the flake inputs. GC's the
+      # store down to 1 GB before saving so the cache stays compact.
+      - name: Cache /nix/store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 1073741824
 
       # Caches Clojure dependency artifacts (Maven jars, git deps, deps.clj
       # cache). Re-keyed whenever deps.edn changes.
       - name: Cache Clojure dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.m2/repository
@@ -59,8 +59,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cljdeps-
 
-      # Realises the dev shell once so subsequent steps reuse the same
-      # /nix/store paths (and the cache picks them up).
+      # Realises the dev shell once. On cold cache, this is where the
+      # /nix/store gets populated from cache.nixos.org; on a warm cache,
+      # the previous step has already restored everything and this just
+      # validates that the flake itself still resolves cleanly.
       - name: Build dev shell
         run: nix develop --command bash -c "echo 'dev shell ready'"
 

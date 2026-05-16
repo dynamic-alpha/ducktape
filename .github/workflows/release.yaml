@@ -26,10 +26,8 @@ jobs:
     timeout-minutes: 20
 
     permissions:
-      id-token: write
       # `contents: write` is needed by softprops/action-gh-release to create
-      # the GitHub Release on a tag push. Snapshot dispatches don't write
-      # anything but the broader permission is harmless.
+      # the GitHub Release on a tag push.
       contents: write
 
     steps:
@@ -39,19 +37,25 @@ jobs:
           # Full history + tags so git-cliff can diff against the previous tag.
           fetch-depth: 0
 
+      # Single-user Nix install — pairs cleanly with cache-nix-action below.
+      # See .github/workflows/ci.yaml for the rationale.
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: nixbuild/nix-quick-install-action@v29
         with:
-          determinate: false
-          extra-conf: |
+          nix_conf: |
+            experimental-features = nix-command flakes
             substituters = https://cache.nixos.org https://nix-community.cachix.org
             trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=
 
-      - name: Enable Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Cache /nix/store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 1073741824
 
       - name: Cache Clojure dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.m2/repository
