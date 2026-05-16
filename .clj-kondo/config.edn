@@ -1,0 +1,6 @@
+;; Project-local clj-kondo config.
+;;
+;; Pulls in the same hooks we ship for downstream consumers, so what we
+;; lint locally matches what users of this library will see.
+{:config-paths
+ ["../resources/clj-kondo.exports/dynamic-alpha/ducktape"]}

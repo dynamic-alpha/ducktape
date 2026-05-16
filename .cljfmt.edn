@@ -1,0 +1,35 @@
+;; cljfmt configuration.
+;;
+;; `:align-*-columns?` ask cljfmt to vertically align let-binding values,
+;; case branches, map values, etc. across consecutive lines.
+;; `:blank-lines-separate-alignment?` keeps a blank line treated as a hard
+;; break so unrelated chunks don't all line up against the widest key in
+;; the file.
+;;
+;; `:remove-multiple-non-indenting-spaces?` is left at its default (false)
+;; so any hand-tuned alignment (e.g. the FFI spec table in `ducktape.ffi`)
+;; is preserved as-is.
+;;
+;; `:extra-indents` merges into cljfmt's built-in indent rules. We use
+;; `[:block 1]` for body-wrapping macros whose first arg is a header
+;; (phase keyword, name, etc.) and remaining args are a body — same
+;; pattern as `when`, `if`, `with-open`. This makes the body 2-indent
+;; from the form's opening paren instead of aligning under the first
+;; arg, which keeps deeply-nested call sites from drifting hard right.
+;;
+;; The same rule is also declared as `{:style/indent 1}` metadata on
+;; the macro itself, which is what Emacs/CIDER and clojure-lsp read.
+;; cljfmt's CLI doesn't read source metadata directly, so this config
+;; is the canonical source for command-line / CI invocations.
+{:align-form-columns?             true
+ :align-map-columns?              true
+ :blank-lines-separate-alignment? true
+ ;; Actively pull whole-line `;;` comments to the surrounding code's
+ ;; indent column. cljfmt's default is `false` (it only reflows comments
+ ;; that fall inside a form's natural indent range); enabling this
+ ;; cleans up comments that were left stranded when surrounding code
+ ;; was re-indented. Top-level `;; ----` section dividers stay at
+ ;; column 0 because the code they sit between is also at column 0,
+ ;; so there's nothing to realign to.
+ :indent-line-comments?           true
+ :extra-indents                   {instr-time [[:block 1]]}}

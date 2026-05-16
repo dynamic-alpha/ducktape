@@ -51,9 +51,9 @@
 
 (defn- load-lib ^SymbolLookup [^String duckdb-home]
   (let [lib-name (System/mapLibraryName "duckdb")
-        path (if (empty? duckdb-home)
-               lib-name
-               (str (Paths/get duckdb-home (into-array String [lib-name]))))]
+        path     (if (empty? duckdb-home)
+                   lib-name
+                   (str (Paths/get duckdb-home (into-array String [lib-name]))))]
     (SymbolLookup/libraryLookup path (Arena/global))))
 
 (defn- sym ^MemorySegment [^String name]
@@ -113,27 +113,27 @@
     DUCKDB_TYPE_USMALLINT    7
     DUCKDB_TYPE_UINTEGER     8
     DUCKDB_TYPE_UBIGINT      9
-    DUCKDB_TYPE_FLOAT       10
-    DUCKDB_TYPE_DOUBLE      11
-    DUCKDB_TYPE_TIMESTAMP   12
-    DUCKDB_TYPE_DATE        13
-    DUCKDB_TYPE_TIME        14
-    DUCKDB_TYPE_INTERVAL    15
-    DUCKDB_TYPE_HUGEINT     16
-    DUCKDB_TYPE_VARCHAR     17
-    DUCKDB_TYPE_BLOB        18
-    DUCKDB_TYPE_DECIMAL     19
+    DUCKDB_TYPE_FLOAT        10
+    DUCKDB_TYPE_DOUBLE       11
+    DUCKDB_TYPE_TIMESTAMP    12
+    DUCKDB_TYPE_DATE         13
+    DUCKDB_TYPE_TIME         14
+    DUCKDB_TYPE_INTERVAL     15
+    DUCKDB_TYPE_HUGEINT      16
+    DUCKDB_TYPE_VARCHAR      17
+    DUCKDB_TYPE_BLOB         18
+    DUCKDB_TYPE_DECIMAL      19
     DUCKDB_TYPE_TIMESTAMP_S  20
     DUCKDB_TYPE_TIMESTAMP_MS 21
     DUCKDB_TYPE_TIMESTAMP_NS 22
-    DUCKDB_TYPE_ENUM        23
-    DUCKDB_TYPE_LIST        24
-    DUCKDB_TYPE_STRUCT      25
-    DUCKDB_TYPE_MAP         26
-    DUCKDB_TYPE_UUID        27
-    DUCKDB_TYPE_UNION       28
+    DUCKDB_TYPE_ENUM         23
+    DUCKDB_TYPE_LIST         24
+    DUCKDB_TYPE_STRUCT       25
+    DUCKDB_TYPE_MAP          26
+    DUCKDB_TYPE_UUID         27
+    DUCKDB_TYPE_UNION        28
     DUCKDB_TYPE_TIMESTAMP_TZ 31
-    DUCKDB_TYPE_ARRAY       33})
+    DUCKDB_TYPE_ARRAY        33})
 
 (defmacro ^:private define-type-constants! []
   `(do ~@(for [[sym val] duckdb-types]
@@ -188,13 +188,13 @@
            to the SAM's expected primitive type."
   {:addr   {:char "M" :tag 'java.lang.foreign.MemorySegment :coerce identity}
    :result {:char "M" :tag 'java.lang.foreign.MemorySegment :coerce identity}
-   :int    {:char "J" :tag 'long   :coerce (fn [x] (list 'long x))}
-   :long   {:char "J" :tag 'long   :coerce (fn [x] (list 'long x))}
-   :byte   {:char "J" :tag 'long   :coerce (fn [x] (list 'long x))}
-   :short  {:char "J" :tag 'long   :coerce (fn [x] (list 'long x))}
+   :int    {:char "J" :tag 'long :coerce (fn [x] (list 'long x))}
+   :long   {:char "J" :tag 'long :coerce (fn [x] (list 'long x))}
+   :byte   {:char "J" :tag 'long :coerce (fn [x] (list 'long x))}
+   :short  {:char "J" :tag 'long :coerce (fn [x] (list 'long x))}
    :float  {:char "D" :tag 'double :coerce (fn [x] (list 'double x))}
    :double {:char "D" :tag 'double :coerce (fn [x] (list 'double x))}
-   :void   {:char "V" :tag 'void   :coerce identity}})
+   :void   {:char "V" :tag 'void :coerce identity}})
 
 (defn- iface-name
   "Build the SAM interface symbol for the signature.
@@ -225,7 +225,7 @@
                          distinct)
         iface-forms
         (for [[ret args] unique-sigs]
-          (let [iname (iface-name ret args)
+          (let [iname  (iface-name ret args)
                 params (mapv (fn [i arg-kw]
                                (with-meta (symbol (str "a" i))
                                  {:tag (:tag (type-info arg-kw))}))
@@ -240,19 +240,19 @@
         ;; Map FFI type → java.lang.Class form for building a `MethodType`.
         ;; Widened primitives (int/byte/short → long, float → double) match
         ;; the widened SAM signatures we generate below.
-        type-class (fn [t]
-                     (case t
-                       (:addr :result) 'java.lang.foreign.MemorySegment
-                       (:int :long :byte :short) 'Long/TYPE
-                       (:float :double) 'Double/TYPE
-                       :void 'Void/TYPE))
+        type-class  (fn [t]
+                      (case t
+                        (:addr :result) 'java.lang.foreign.MemorySegment
+                        (:int :long :byte :short) 'Long/TYPE
+                        (:float :double) 'Double/TYPE
+                        :void 'Void/TYPE))
         reset-forms
         (for [[cname ret args _] specs]
-          (let [aname (symbol (str "-" cname))
-                ret-l (resolve-layout ret)
-                arg-ls (mapv resolve-layout args)
-                iname (iface-name ret args)
-                ret-cls (type-class ret)
+          (let [aname     (symbol (str "-" cname))
+                ret-l     (resolve-layout ret)
+                arg-ls    (mapv resolve-layout args)
+                iname     (iface-name ret args)
+                ret-cls   (type-class ret)
                 arg-clses (mapv type-class args)
                 desc-form (if (= ret :void)
                             `(FunctionDescriptor/ofVoid (into-array MemoryLayout ~arg-ls))
@@ -269,9 +269,9 @@
                (reset! ~aname proxy#))))
         wrapper-fns
         (for [[cname ret args coerce] specs]
-          (let [fname  (symbol cname)
-                aname  (symbol (str "-" cname))
-                iname  (iface-name ret args)
+          (let [fname        (symbol cname)
+                aname        (symbol (str "-" cname))
+                iname        (iface-name ret args)
                 hinted-params
                 (mapv (fn [i arg-kw]
                         (with-meta (symbol (str "a" i))
@@ -280,18 +280,18 @@
                       args)
                 coerced-args (mapv (fn [p arg-kw] ((:coerce (type-info arg-kw)) p))
                                    hinted-params args)
-                call `(.apply ~(with-meta `(deref ~aname) {:tag iname})
-                              ~@coerced-args)
-                with-coerce (case coerce
-                              :int  `(int ~call)
-                              :long `(long ~call)
-                              call)
+                call         `(.apply ~(with-meta `(deref ~aname) {:tag iname})
+                                      ~@coerced-args)
+                with-coerce  (case coerce
+                               :int  `(int ~call)
+                               :long `(long ~call)
+                               call)
                 ;; Only put a fn return tag on MemorySegment-returning fns —
                 ;; for primitive returns the `with-coerce` form already
                 ;; produces the right boxed type via `(int ...)` / `(long ...)`.
-                fn-meta (case ret
-                          (:addr :result) {:tag 'java.lang.foreign.MemorySegment}
-                          nil)]
+                fn-meta      (case ret
+                               (:addr :result) {:tag 'java.lang.foreign.MemorySegment}
+                               nil)]
             (if fn-meta
               `(defn ~(with-meta fname fn-meta) ~hinted-params ~with-coerce)
               `(defn ~fname ~hinted-params ~with-coerce))))]
@@ -420,8 +420,8 @@
 
 (defn alloc-c-str ^MemorySegment [^Arena arena ^String s]
   (let [bytes (.getBytes s "UTF-8")
-        n (alength bytes)
-        seg (.allocate arena (inc n))]
+        n     (alength bytes)
+        seg   (.allocate arena (inc n))]
     (MemorySegment/copy bytes 0 seg VL-BYTE 0 n)
     (.set seg VL-BYTE (long n) (byte 0))
     seg))

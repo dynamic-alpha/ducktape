@@ -3,3 +3,4 @@
 /.nrepl-port
 /.envrc
 /classes/
+.clj-kondo/.cache/

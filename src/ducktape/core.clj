@@ -55,10 +55,10 @@
                                     "")]
                 (log/infof "Attempting to load duckdb from \"%s\"" duckdb-home)
                 (ffi/define-datatypes! duckdb-home)))
-       ;; Check version
-            (let [ver (ffi/read-c-str (ffi/duckdb_library_version))
+            ;; Check version
+            (let [ver       (ffi/read-c-str (ffi/duckdb_library_version))
                   [_ major] (re-find #"^v?(\d+)" ver)
-                  major (when major (Long/parseLong major))]
+                  major     (when major (Long/parseLong major))]
               (when (and major (< major 1))
                 (throw (RuntimeException. (str "Unsupported DuckDB version: " ver)))))
             true)))
@@ -72,9 +72,9 @@
   "Open a database. path may be nil for in-memory."
   (^long [^String path config-options]
    (with-open [arena (Arena/ofConfined)]
-     (let [path (or path "")
+     (let [path       (or path "")
            config-ptr (when-not (empty? config-options)
-                        (let [cp (.allocate arena ffi/VL-ADDR)
+                        (let [cp   (.allocate arena ffi/VL-ADDR)
                               ccrc (ffi/duckdb_create_config cp)]
                           ;; Guard against a NULL config: skipping the rc
                           ;; check would let `duckdb_set_config` dereference
@@ -89,13 +89,13 @@
                                                      (ffi/alloc-c-str arena (str k))
                                                      (ffi/alloc-c-str arena (str v))))
                             cfg)))
-           db-ptr (.allocate arena ffi/VL-ADDR)
-           err-ptr (.allocate arena ffi/VL-ADDR)
-           rc (ffi/duckdb_open_ext
-               (ffi/alloc-c-str arena path)
-               db-ptr
-               (if config-ptr config-ptr MemorySegment/NULL)
-               err-ptr)]
+           db-ptr     (.allocate arena ffi/VL-ADDR)
+           err-ptr    (.allocate arena ffi/VL-ADDR)
+           rc         (ffi/duckdb_open_ext
+                       (ffi/alloc-c-str arena path)
+                       db-ptr
+                       (if config-ptr config-ptr MemorySegment/NULL)
+                       err-ptr)]
        ;; Destroy config if we created one
        (when config-ptr
          (ffi/destroy-ptr! ffi/duckdb_destroy_config config-ptr))
@@ -143,10 +143,10 @@
   [^long conn ^String sql]
   (with-open [arena (Arena/ofConfined)]
     (let [result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
-          rc (ffi/duckdb_query
-              (MemorySegment/ofAddress conn)
-              (ffi/alloc-c-str arena sql)
-              result)]
+          rc     (ffi/duckdb_query
+                  (MemorySegment/ofAddress conn)
+                  (ffi/alloc-c-str arena sql)
+                  result)]
       (when-not (== rc ffi/DuckDBSuccess)
         (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result))]
           (ffi/duckdb_destroy_result result)
@@ -203,28 +203,28 @@
 (def ^:private write-col-specs
   "dtype → [byte-width target-dtype needs-pack?]
   Covers every column type that can be bulk-copied via dt/copy!."
-  {:boolean          [1 :int8   false]
-   :int8             [1 :int8   false]
-   :uint8            [1 :uint8  false]
-   :int16            [2 :int16  false]
-   :uint16           [2 :uint16 false]
-   :int32            [4 :int32  false]
-   :uint32           [4 :uint32 false]
-   :float32          [4 :float32 false]
-   :int64            [8 :int64  false]
-   :uint64           [8 :uint64 false]
-   :float64          [8 :float64 false]
-   :local-date       [4 :int32  true]
+  {:boolean           [1 :int8   false]
+   :int8              [1 :int8   false]
+   :uint8             [1 :uint8  false]
+   :int16             [2 :int16  false]
+   :uint16            [2 :uint16 false]
+   :int32             [4 :int32  false]
+   :uint32            [4 :uint32 false]
+   :float32           [4 :float32 false]
+   :int64             [8 :int64  false]
+   :uint64            [8 :uint64 false]
+   :float64           [8 :float64 false]
+   :local-date        [4 :int32  true]
    :packed-local-date [4 :int32 false]
-   :local-time       [8 :int64  true]
+   :local-time        [8 :int64  true]
    :packed-local-time [8 :int64 false]
-   :instant          [8 :int64  true]
-   :packed-instant   [8 :int64  false]})
+   :instant           [8 :int64  true]
+   :packed-instant    [8 :int64  false]})
 
 (defn- write-validity!
   "Write the validity bitmap for `missing` into the DuckDB validity segment."
   [^MemorySegment validity-seg ^RoaringBitmap missing ^long row-count]
-  (let [n-valid (long (Math/ceil (/ (double row-count) 64)))
+  (let [n-valid      (long (Math/ceil (/ (double row-count) 64)))
         missing-card (long (.getCardinality missing))]
     (cond
       (== missing-card row-count)
@@ -242,10 +242,10 @@
         (let [miter (.getIntIterator missing)]
           (loop []
             (when (.hasNext miter)
-              (let [ne (Integer/toUnsignedLong (.next miter))
-                    vidx (quot ne 64)
+              (let [ne      (Integer/toUnsignedLong (.next miter))
+                    vidx    (quot ne 64)
                     bit-idx (rem ne 64)
-                    cv (.get validity-seg ffi/VL-LONG (long (* vidx 8)))]
+                    cv      (.get validity-seg ffi/VL-LONG (long (* vidx 8)))]
                 (.set validity-seg ffi/VL-LONG (long (* vidx 8))
                       (bit-and-not cv (bit-shift-left 1 bit-idx)))
                 (recur)))))))))
@@ -253,11 +253,11 @@
 (defn- write-uuid!
   [^MemorySegment data-ptr subcol ^long row-count]
   ;; Fill a JVM long array (no bounds-check overhead), then bulk-copy to native memory
-  (let [n2 (long (* 2 row-count))
+  (let [n2          (long (* 2 row-count))
         ^longs bits (long-array n2)]
     (dotimes [i row-count]
       (let [^UUID uuid (subcol i)
-            off (long (* 2 i))]
+            off        (long (* 2 i))]
         (when uuid
           (aset bits off (.getLeastSignificantBits uuid))
           (aset bits (unchecked-inc off) (.getMostSignificantBits uuid)))))
@@ -267,20 +267,20 @@
 (defn- write-string!
   [^Arena arena ^MemorySegment data-ptr subcol ^long row-count]
   ;; Phase 1: encode all strings to byte arrays + compute total pointer-string bytes
-  (let [^objects encoded (object-array row-count)
-        total-ptr-bytes (loop [i 0 acc 0]
-                          (if (< i row-count)
-                            (let [v (subcol i)
-                                  ^bytes b (.getBytes (if (string? v) ^String v (str v)) "UTF-8")]
-                              (aset encoded i b)
-                              (recur (unchecked-inc i)
-                                     (if (> (alength b) 12) (+ acc (alength b)) acc)))
-                            acc))
+  (let [^objects encoded    (object-array row-count)
+        total-ptr-bytes     (loop [i 0 acc 0]
+                              (if (< i row-count)
+                                (let [v        (subcol i)
+                                      ^bytes b (.getBytes (if (string? v) ^String v (str v)) "UTF-8")]
+                                  (aset encoded i b)
+                                  (recur (unchecked-inc i)
+                                         (if (> (alength b) 12) (+ acc (alength b)) acc)))
+                                acc))
         ;; Phase 2: allocate one slab for all pointer-string data
         ^MemorySegment slab (when (pos? total-ptr-bytes)
                               (.allocate arena (long total-ptr-bytes)))
-        slab-offset (java.util.concurrent.atomic.AtomicLong. 0)
-        base-addr (.address data-ptr)]
+        slab-offset         (java.util.concurrent.atomic.AtomicLong. 0)
+        base-addr           (.address data-ptr)]
     ;; Phase 3: parallel write duckdb_string_t entries
     (dorun
      (hamf/pgroups row-count
@@ -289,13 +289,13 @@
                                                              (* (- eidx sidx) 16))]
                        (dotimes [i (- eidx sidx)]
                          (let [^bytes sbytes (aget encoded (int (+ sidx i)))
-                               slen (alength sbytes)
-                               off (long (* i 16))]
+                               slen          (alength sbytes)
+                               off           (long (* i 16))]
                            (.set dseg ffi/VL-INT off slen)
                            (if (<= slen 12)
                              (MemorySegment/copy sbytes 0 dseg ffi/VL-BYTE (+ off 4) slen)
                              ;; Bump-allocate from slab (lock-free via AtomicLong)
-                             (let [slab-off (.getAndAdd slab-offset (long slen))
+                             (let [slab-off           (.getAndAdd slab-offset (long slen))
                                    ^MemorySegment buf (.asSlice slab slab-off (long slen))]
                                (MemorySegment/copy sbytes 0 buf ffi/VL-BYTE 0 slen)
                                (.set dseg ffi/VL-LONG (+ off 8) (.address buf))))))))))))
@@ -303,33 +303,33 @@
 (defn- write-blob!
   "Write byte[] values into DuckDB BLOB vector (same string_t format as VARCHAR)."
   [^Arena arena ^MemorySegment data-ptr subcol row-count]
-  (let [row-count (long row-count)
+  (let [row-count           (long row-count)
         ;; Phase 1: compute total pointer-blob bytes
-        total-ptr-bytes (loop [i 0 acc 0]
-                          (if (< i row-count)
-                            (let [v (subcol i)]
-                              (if (nil? v)
-                                (recur (unchecked-inc i) acc)
-                                (let [^bytes b v
-                                      blen (alength b)]
-                                  (recur (unchecked-inc i)
-                                         (if (> blen 12) (+ acc blen) acc)))))
-                            acc))
+        total-ptr-bytes     (loop [i 0 acc 0]
+                              (if (< i row-count)
+                                (let [v (subcol i)]
+                                  (if (nil? v)
+                                    (recur (unchecked-inc i) acc)
+                                    (let [^bytes b v
+                                          blen     (alength b)]
+                                      (recur (unchecked-inc i)
+                                             (if (> blen 12) (+ acc blen) acc)))))
+                                acc))
         ^MemorySegment slab (when (pos? total-ptr-bytes)
                               (.allocate arena (long total-ptr-bytes)))
-        slab-offset (java.util.concurrent.atomic.AtomicLong. 0)
-        base-addr (.address data-ptr)
+        slab-offset         (java.util.concurrent.atomic.AtomicLong. 0)
+        base-addr           (.address data-ptr)
         ^MemorySegment dseg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 row-count))]
     (dotimes [i row-count]
       (let [v (subcol i)]
         (when v
           (let [^bytes b v
-                blen (alength b)
-                off (long (* i 16))]
+                blen     (alength b)
+                off      (long (* i 16))]
             (.set dseg ffi/VL-INT off blen)
             (if (<= blen 12)
               (MemorySegment/copy b 0 dseg ffi/VL-BYTE (+ off 4) blen)
-              (let [slab-off (.getAndAdd slab-offset (long blen))
+              (let [slab-off           (.getAndAdd slab-offset (long blen))
                     ^MemorySegment buf (.asSlice slab slab-off (long blen))]
                 (MemorySegment/copy b 0 buf ffi/VL-BYTE 0 blen)
                 (.set dseg ffi/VL-LONG (+ off 8) (.address buf))))))))))
@@ -337,25 +337,25 @@
 (defn- write-hugeint!
   "Write BigInteger values into a DuckDB HUGEINT vector (16 bytes: lower uint64 + upper int64)."
   [^MemorySegment data-ptr subcol row-count]
-  (let [row-count (long row-count)
-        base-addr (.address data-ptr)
+  (let [row-count          (long row-count)
+        base-addr          (.address data-ptr)
         ^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 row-count))]
     (dotimes [i row-count]
       (let [v (subcol i)]
         (when v
           (let [^BigInteger bi (if (instance? BigInteger v) v (BigInteger/valueOf (long v)))
-                off (long (* i 16))
+                off            (long (* i 16))
                 ;; Extract lower 64 bits and upper 64 bits
-                lower (.longValue bi)
-                upper (.longValue (.shiftRight bi 64))]
+                lower          (.longValue bi)
+                upper          (.longValue (.shiftRight bi 64))]
             (.set seg ffi/VL-LONG off lower)
             (.set seg ffi/VL-LONG (+ off 8) upper)))))))
 
 (defn- write-interval!
   "Write interval maps {:months :days :micros} into a DuckDB INTERVAL vector."
   [^MemorySegment data-ptr subcol row-count]
-  (let [row-count (long row-count)
-        base-addr (.address data-ptr)
+  (let [row-count          (long row-count)
+        base-addr          (.address data-ptr)
         ^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 row-count))]
     (dotimes [i row-count]
       (let [v (subcol i)]
@@ -369,7 +369,7 @@
   "Write BigDecimal values into a DuckDB DECIMAL vector based on internal type."
   [^MemorySegment data-ptr subcol row-count scale internal-kw]
   (let [row-count (long row-count)
-        scale (int scale)
+        scale     (int scale)
         base-addr (.address data-ptr)]
     (case internal-kw
       :DUCKDB_TYPE_SMALLINT
@@ -400,9 +400,9 @@
             (when v
               (let [^BigDecimal bd (if (instance? BigDecimal v) v (BigDecimal/valueOf (double v)))
                     ^BigInteger bi (.unscaledValue (.setScale bd scale))
-                    off (long (* i 16))
-                    lower (.longValue bi)
-                    upper (.longValue (.shiftRight bi 64))]
+                    off            (long (* i 16))
+                    lower          (.longValue bi)
+                    upper          (.longValue (.shiftRight bi 64))]
                 (.set seg ffi/VL-LONG off lower)
                 (.set seg ffi/VL-LONG (+ off 8) upper)))))))))
 
@@ -416,8 +416,8 @@
 (defn- write-timestamp-converted!
   "Write Instant values as TIMESTAMP_S/MS/NS by converting to target precision."
   [^MemorySegment data-ptr subcol row-count mode]
-  (let [row-count (long row-count)
-        base-addr (.address data-ptr)
+  (let [row-count          (long row-count)
+        base-addr          (.address data-ptr)
         ^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 8 row-count))]
     (dotimes [i row-count]
       (let [v (subcol i)]
@@ -432,23 +432,23 @@
 
 (def ^:private duckdb-type->write-dtype
   "Map DuckDB type keywords to dataset dtype keywords for STRUCT child writing."
-  {:DUCKDB_TYPE_BOOLEAN   :boolean
-   :DUCKDB_TYPE_TINYINT   :int8
-   :DUCKDB_TYPE_SMALLINT  :int16
-   :DUCKDB_TYPE_INTEGER   :int32
-   :DUCKDB_TYPE_BIGINT    :int64
-   :DUCKDB_TYPE_UTINYINT  :uint8
-   :DUCKDB_TYPE_USMALLINT :uint16
-   :DUCKDB_TYPE_UINTEGER  :uint32
-   :DUCKDB_TYPE_UBIGINT   :uint64
-   :DUCKDB_TYPE_FLOAT     :float32
-   :DUCKDB_TYPE_DOUBLE    :float64
-   :DUCKDB_TYPE_DATE      :local-date
-   :DUCKDB_TYPE_TIME      :local-time
-   :DUCKDB_TYPE_TIMESTAMP :instant
+  {:DUCKDB_TYPE_BOOLEAN      :boolean
+   :DUCKDB_TYPE_TINYINT      :int8
+   :DUCKDB_TYPE_SMALLINT     :int16
+   :DUCKDB_TYPE_INTEGER      :int32
+   :DUCKDB_TYPE_BIGINT       :int64
+   :DUCKDB_TYPE_UTINYINT     :uint8
+   :DUCKDB_TYPE_USMALLINT    :uint16
+   :DUCKDB_TYPE_UINTEGER     :uint32
+   :DUCKDB_TYPE_UBIGINT      :uint64
+   :DUCKDB_TYPE_FLOAT        :float32
+   :DUCKDB_TYPE_DOUBLE       :float64
+   :DUCKDB_TYPE_DATE         :local-date
+   :DUCKDB_TYPE_TIME         :local-time
+   :DUCKDB_TYPE_TIMESTAMP    :instant
    :DUCKDB_TYPE_TIMESTAMP_TZ :instant
-   :DUCKDB_TYPE_VARCHAR   :string
-   :DUCKDB_TYPE_UUID      :uuid})
+   :DUCKDB_TYPE_VARCHAR      :string
+   :DUCKDB_TYPE_UUID         :uuid})
 
 (defn- write-enum!
   "Write string values as ENUM dictionary indices."
@@ -459,19 +459,19 @@
       :DUCKDB_TYPE_UTINYINT
       (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) row-count)]
         (dotimes [i row-count]
-          (let [v (subcol i)
+          (let [v   (subcol i)
                 idx (int (get dict-reverse (if (string? v) v (str v)) 0))]
             (.set seg ffi/VL-BYTE (long i) (byte idx)))))
       :DUCKDB_TYPE_USMALLINT
       (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 2 row-count))]
         (dotimes [i row-count]
-          (let [v (subcol i)
+          (let [v   (subcol i)
                 idx (int (get dict-reverse (if (string? v) v (str v)) 0))]
             (.set seg ffi/VL-SHORT (long (* i 2)) (short idx)))))
       :DUCKDB_TYPE_UINTEGER
       (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 4 row-count))]
         (dotimes [i row-count]
-          (let [v (subcol i)
+          (let [v   (subcol i)
                 idx (int (get dict-reverse (if (string? v) v (str v)) 0))]
             (.set seg ffi/VL-INT (long (* i 4)) idx)))))))
 
@@ -479,7 +479,7 @@
   "Write `subcol` data into DuckDB vector memory at `data-ptr`."
   [^Arena arena ^MemorySegment data-ptr subcol row-count col-dt daddr]
   (let [row-count (long row-count)
-        daddr (long daddr)]
+        daddr     (long daddr)]
     (if-let [[^long bw target-dt pack?] (get write-col-specs col-dt)]
       ;; Numeric / temporal — bulk copy through native-buffer (dtype's fast path)
       (let [src (if pack? (packing/pack subcol) subcol)]
@@ -491,25 +491,25 @@
 (defn- write-struct!
   "Write a column of maps into a DuckDB STRUCT vector's child vectors."
   [^Arena arena ^MemorySegment dvec subcol row-count child-names child-type-ids]
-  (let [row-count (long row-count)
+  (let [row-count  (long row-count)
         n-children (count child-names)]
     (dotimes [ci n-children]
-      (let [child-key (keyword (child-names ci))
-            child-tid (long (child-type-ids ci))
-            child-type-kw (get ffi/duckdb-type-map child-tid)
-            child-dtype (get duckdb-type->write-dtype child-type-kw)
-            ^MemorySegment cvec (ffi/duckdb_struct_vector_get_child dvec (long ci))
-            _ (ffi/duckdb_vector_ensure_validity_writable cvec)
-            ^MemorySegment cdata (ffi/duckdb_vector_get_data cvec)
+      (let [child-key             (keyword (child-names ci))
+            child-tid             (long (child-type-ids ci))
+            child-type-kw         (get ffi/duckdb-type-map child-tid)
+            child-dtype           (get duckdb-type->write-dtype child-type-kw)
+            ^MemorySegment cvec   (ffi/duckdb_struct_vector_get_child dvec (long ci))
+            _                     (ffi/duckdb_vector_ensure_validity_writable cvec)
+            ^MemorySegment cdata  (ffi/duckdb_vector_get_data cvec)
             ^MemorySegment cvalid (ffi/duckdb_vector_get_validity cvec)
             ;; Create reader extracting field values from maps
-            field-reader (reify ObjectReader
-                           (lsize [_] row-count)
-                           (readObject [_ idx]
-                             (let [m (subcol idx)]
-                               (when m (get m child-key)))))
+            field-reader          (reify ObjectReader
+                                    (lsize [_] row-count)
+                                    (readObject [_ idx]
+                                      (let [m (subcol idx)]
+                                        (when m (get m child-key)))))
             ;; Compute child validity
-            child-missing (RoaringBitmap.)]
+            child-missing         (RoaringBitmap.)]
         (dotimes [i row-count]
           (when (nil? (field-reader i))
             (.add child-missing (int i))))
@@ -521,30 +521,30 @@
 (defn- write-list!
   "Write a column of vectors/lists into a DuckDB LIST vector."
   [^Arena arena ^MemorySegment dvec subcol row-count child-type-info]
-  (let [row-count (long row-count)
+  (let [row-count                     (long row-count)
         ;; Compute total child count and list entries
-        total-children (loop [i 0 acc 0]
-                         (if (< i row-count)
-                           (let [v (subcol i)]
-                             (recur (unchecked-inc i)
-                                    (if (and v (sequential? v)) (+ acc (count v)) acc)))
-                           acc))
+        total-children                (loop [i 0 acc 0]
+                                        (if (< i row-count)
+                                          (let [v (subcol i)]
+                                            (recur (unchecked-inc i)
+                                                   (if (and v (sequential? v)) (+ acc (count v)) acc)))
+                                          acc))
         ;; Write list_entry_t array (offset + length)
-        ^MemorySegment entry-data (ffi/duckdb_vector_get_data dvec)
-        ^MemorySegment entry-seg (.reinterpret entry-data (* 16 row-count))
-        _ (ffi/duckdb_list_vector_set_size dvec (long total-children))
-        ^MemorySegment child-vec (ffi/duckdb_list_vector_get_child dvec)
-        _ (ffi/duckdb_vector_ensure_validity_writable child-vec)
-        ^MemorySegment child-data (ffi/duckdb_vector_get_data child-vec)
+        ^MemorySegment entry-data     (ffi/duckdb_vector_get_data dvec)
+        ^MemorySegment entry-seg      (.reinterpret entry-data (* 16 row-count))
+        _                             (ffi/duckdb_list_vector_set_size dvec (long total-children))
+        ^MemorySegment child-vec      (ffi/duckdb_list_vector_get_child dvec)
+        _                             (ffi/duckdb_vector_ensure_validity_writable child-vec)
+        ^MemorySegment child-data     (ffi/duckdb_vector_get_data child-vec)
         ^MemorySegment child-validity (ffi/duckdb_vector_get_validity child-vec)
-        child-type-kw (get ffi/duckdb-type-map (long (:type-id child-type-info)))
-        child-dtype (get duckdb-type->write-dtype child-type-kw)
-        flat-vals (object-array total-children)
-        child-missing (RoaringBitmap.)]
+        child-type-kw                 (get ffi/duckdb-type-map (long (:type-id child-type-info)))
+        child-dtype                   (get duckdb-type->write-dtype child-type-kw)
+        flat-vals                     (object-array total-children)
+        child-missing                 (RoaringBitmap.)]
     ;; Phase 1: write list_entry_t offsets/lengths and collect flat child data
     (loop [i 0 offset 0]
       (when (< i row-count)
-        (let [v (subcol i)
+        (let [v         (subcol i)
               entry-off (long (* i 16))]
           (if (and v (sequential? v))
             (let [n (count v)]
@@ -552,7 +552,7 @@
               (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
               (dotimes [j n]
                 (let [elem (nth v j)
-                      ci (+ offset j)]
+                      ci   (+ offset j)]
                   (if (nil? elem)
                     (.add child-missing (int ci))
                     (aset flat-vals ci elem))))
@@ -562,7 +562,7 @@
               (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long 0))
               (recur (unchecked-inc i) offset))))))
     ;; Phase 2: write child validity
-    (let [n-valid-words (long (Math/ceil (/ (double total-children) 64)))
+    (let [n-valid-words           (long (Math/ceil (/ (double total-children) 64)))
           ^MemorySegment cval-seg (.reinterpret child-validity (* n-valid-words 8))]
       (write-validity! cval-seg child-missing total-children))
     ;; Phase 3: write child data using existing infrastructure
@@ -578,50 +578,50 @@
 (defn- write-map!
   "Write a column of Clojure maps into a DuckDB MAP vector (LIST<STRUCT{key,value}>)."
   [^Arena arena ^MemorySegment dvec subcol row-count key-type-info val-type-info]
-  (let [row-count (long row-count)
+  (let [row-count                   (long row-count)
         ;; Compute total entries across all maps
-        total-entries (loop [i 0 acc 0]
-                        (if (< i row-count)
-                          (let [v (subcol i)]
-                            (recur (unchecked-inc i)
-                                   (if (and v (map? v)) (+ acc (count v)) acc)))
-                          acc))
+        total-entries               (loop [i 0 acc 0]
+                                      (if (< i row-count)
+                                        (let [v (subcol i)]
+                                          (recur (unchecked-inc i)
+                                                 (if (and v (map? v)) (+ acc (count v)) acc)))
+                                        acc))
         ;; Write list_entry_t for the parent LIST vector
-        ^MemorySegment entry-data (ffi/duckdb_vector_get_data dvec)
-        ^MemorySegment entry-seg (.reinterpret entry-data (* 16 row-count))
-        _ (ffi/duckdb_list_vector_set_size dvec (long total-entries))
+        ^MemorySegment entry-data   (ffi/duckdb_vector_get_data dvec)
+        ^MemorySegment entry-seg    (.reinterpret entry-data (* 16 row-count))
+        _                           (ffi/duckdb_list_vector_set_size dvec (long total-entries))
         ;; Child is STRUCT{key, value} — get its two sub-children
-        ^MemorySegment struct-vec (ffi/duckdb_list_vector_get_child dvec)
-        ^MemorySegment key-vec (ffi/duckdb_struct_vector_get_child struct-vec 0)
-        ^MemorySegment val-vec (ffi/duckdb_struct_vector_get_child struct-vec 1)
-        _ (ffi/duckdb_vector_ensure_validity_writable key-vec)
-        _ (ffi/duckdb_vector_ensure_validity_writable val-vec)
-        ^MemorySegment key-data (ffi/duckdb_vector_get_data key-vec)
-        ^MemorySegment val-data (ffi/duckdb_vector_get_data val-vec)
+        ^MemorySegment struct-vec   (ffi/duckdb_list_vector_get_child dvec)
+        ^MemorySegment key-vec      (ffi/duckdb_struct_vector_get_child struct-vec 0)
+        ^MemorySegment val-vec      (ffi/duckdb_struct_vector_get_child struct-vec 1)
+        _                           (ffi/duckdb_vector_ensure_validity_writable key-vec)
+        _                           (ffi/duckdb_vector_ensure_validity_writable val-vec)
+        ^MemorySegment key-data     (ffi/duckdb_vector_get_data key-vec)
+        ^MemorySegment val-data     (ffi/duckdb_vector_get_data val-vec)
         ^MemorySegment key-validity (ffi/duckdb_vector_get_validity key-vec)
         ^MemorySegment val-validity (ffi/duckdb_vector_get_validity val-vec)
-        key-type-kw (get ffi/duckdb-type-map (long (:type-id key-type-info)))
-        val-type-kw (get ffi/duckdb-type-map (long (:type-id val-type-info)))
-        key-dtype (get duckdb-type->write-dtype key-type-kw)
-        val-dtype (get duckdb-type->write-dtype val-type-kw)
+        key-type-kw                 (get ffi/duckdb-type-map (long (:type-id key-type-info)))
+        val-type-kw                 (get ffi/duckdb-type-map (long (:type-id val-type-info)))
+        key-dtype                   (get duckdb-type->write-dtype key-type-kw)
+        val-dtype                   (get duckdb-type->write-dtype val-type-kw)
         ;; Flatten keys and values, write list entries
-        ^objects flat-keys (object-array total-entries)
-        ^objects flat-vals (object-array total-entries)
-        key-missing (RoaringBitmap.)
-        val-missing (RoaringBitmap.)]
+        ^objects flat-keys          (object-array total-entries)
+        ^objects flat-vals          (object-array total-entries)
+        key-missing                 (RoaringBitmap.)
+        val-missing                 (RoaringBitmap.)]
     (loop [i 0 offset 0]
       (when (< i row-count)
-        (let [v (subcol i)
+        (let [v         (subcol i)
               entry-off (long (* i 16))]
           (if (and v (map? v))
             (let [entries (seq v)
-                  n (count entries)]
+                  n       (count entries)]
               (.set entry-seg ffi/VL-LONG entry-off (long offset))
               (.set entry-seg ffi/VL-LONG (+ entry-off 8) (long n))
               (loop [es entries j 0]
                 (when es
                   (let [[k vv] (first es)
-                        ci (+ offset j)]
+                        ci     (+ offset j)]
                     (if (nil? k) (.add key-missing (int ci)) (aset flat-keys ci k))
                     (if (nil? vv) (.add val-missing (int ci)) (aset flat-vals ci vv))
                     (recur (next es) (unchecked-inc j)))))
@@ -661,29 +661,29 @@
   (reduce
    (fn [m ci]
      (let [^MemorySegment lt (ffi/duckdb_appender_column_type appender (long ci))
-           tid (ffi/duckdb_get_type_id lt)
-           kw  (get ffi/duckdb-type-map tid)]
+           tid               (ffi/duckdb_get_type_id lt)
+           kw                (get ffi/duckdb-type-map tid)]
        (case kw
          :DUCKDB_TYPE_ENUM
-         (let [dict-size (ffi/duckdb_enum_dictionary_size lt)
-               dict (mapv (fn [i]
-                            (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
-                                  v (ffi/read-c-str s)]
-                              (ffi/duckdb_free s) v))
-                          (range dict-size))
+         (let [dict-size    (ffi/duckdb_enum_dictionary_size lt)
+               dict         (mapv (fn [i]
+                                    (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
+                                          v                (ffi/read-c-str s)]
+                                      (ffi/duckdb_free s) v))
+                                  (range dict-size))
                dict-reverse (into {} (map-indexed (fn [i v] [v i]) dict))
-               internal-kw (get ffi/duckdb-type-map (ffi/duckdb_enum_internal_type lt))]
+               internal-kw  (get ffi/duckdb-type-map (ffi/duckdb_enum_internal_type lt))]
            (assoc m ci {:kw kw :lt lt :dict-reverse dict-reverse :internal-kw internal-kw}))
          :DUCKDB_TYPE_STRUCT
-         (let [n (ffi/duckdb_struct_type_child_count lt)
-               child-names (mapv (fn [i]
-                                   (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
-                                         v (ffi/read-c-str s)]
-                                     (ffi/duckdb_free s) v))
-                                 (range n))
+         (let [n              (ffi/duckdb_struct_type_child_count lt)
+               child-names    (mapv (fn [i]
+                                      (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
+                                            v                (ffi/read-c-str s)]
+                                        (ffi/duckdb_free s) v))
+                                    (range n))
                child-type-ids (mapv (fn [i]
                                       (let [^MemorySegment clt (ffi/duckdb_struct_type_child_type lt (long i))
-                                            tid (ffi/duckdb_get_type_id clt)]
+                                            tid                (ffi/duckdb_get_type_id clt)]
                                         (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type clt)
                                         tid))
                                     (range n))]
@@ -697,24 +697,24 @@
          :DUCKDB_TYPE_INTERVAL
          (assoc m ci {:kw kw :lt lt})
          :DUCKDB_TYPE_DECIMAL
-         (let [scale-val (ffi/duckdb_decimal_scale lt)
-               width-val (ffi/duckdb_decimal_width lt)
+         (let [scale-val     (ffi/duckdb_decimal_scale lt)
+               width-val     (ffi/duckdb_decimal_width lt)
                internal-type (ffi/duckdb_decimal_internal_type lt)
-               internal-kw (get ffi/duckdb-type-map internal-type)]
+               internal-kw   (get ffi/duckdb-type-map internal-type)]
            (assoc m ci {:kw kw :lt lt :scale scale-val :width width-val :internal-kw internal-kw}))
          :DUCKDB_TYPE_LIST
          (let [^MemorySegment child-lt (ffi/duckdb_list_type_child_type lt)
-               child-tid (ffi/duckdb_get_type_id child-lt)
-               child-info {:type-id child-tid}]
+               child-tid               (ffi/duckdb_get_type_id child-lt)
+               child-info              {:type-id child-tid}]
            (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
            (assoc m ci {:kw kw :lt lt :child-type child-info}))
          :DUCKDB_TYPE_MAP
          ;; MAP is LIST<STRUCT{key, value}> — extract key/value types
          (let [^MemorySegment list-child-lt (ffi/duckdb_list_type_child_type lt)
-               ^MemorySegment key-lt (ffi/duckdb_struct_type_child_type list-child-lt 0)
-               ^MemorySegment val-lt (ffi/duckdb_struct_type_child_type list-child-lt 1)
-               key-info {:type-id (ffi/duckdb_get_type_id key-lt)}
-               val-info {:type-id (ffi/duckdb_get_type_id val-lt)}]
+               ^MemorySegment key-lt        (ffi/duckdb_struct_type_child_type list-child-lt 0)
+               ^MemorySegment val-lt        (ffi/duckdb_struct_type_child_type list-child-lt 1)
+               key-info                     {:type-id (ffi/duckdb_get_type_id key-lt)}
+               val-info                     {:type-id (ffi/duckdb_get_type_id val-lt)}]
            (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type key-lt)
            (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type val-lt)
            (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type list-child-lt)
@@ -734,12 +734,12 @@
   data chunk fails to allocate) the appender is destroyed before re-throwing."
   [^long conn ^String table-name schema-dataset]
   (with-open [setup-arena (Arena/ofConfined)]
-    (let [conn-seg (MemorySegment/ofAddress conn)
-          app-ptr  (.allocate setup-arena ffi/VL-ADDR)
-          app-rc   (ffi/duckdb_appender_create conn-seg
-                                               (ffi/alloc-c-str setup-arena "")
-                                               (ffi/alloc-c-str setup-arena table-name)
-                                               app-ptr)
+    (let [conn-seg                (MemorySegment/ofAddress conn)
+          app-ptr                 (.allocate setup-arena ffi/VL-ADDR)
+          app-rc                  (ffi/duckdb_appender_create conn-seg
+                                                              (ffi/alloc-c-str setup-arena "")
+                                                              (ffi/alloc-c-str setup-arena table-name)
+                                                              app-ptr)
           ^MemorySegment appender (.get app-ptr ffi/VL-ADDR 0)]
       (when-not (== (int app-rc) ffi/DuckDBSuccess)
         (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
@@ -753,45 +753,45 @@
       ;; on the returned state map; on failure the catch drains them.
       (let [^java.util.ArrayList cleanup-lts (java.util.ArrayList.)]
         (try
-          (let [n-cols       (ds/column-count schema-dataset)
-                colvec       (vec (ds/columns schema-dataset))
-                dtypes       (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
-                duckdb-ids   (mapv dtype->duckdb-type dtypes)
+          (let [n-cols                     (ds/column-count schema-dataset)
+                colvec                     (vec (ds/columns schema-dataset))
+                dtypes                     (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
+                duckdb-ids                 (mapv dtype->duckdb-type dtypes)
                 ;; Only probe appender column types when dataset has columns
                 ;; that may need special handling. Pure numeric/temporal/uuid
                 ;; datasets skip all probe FFI calls.
-                needs-probe? (some (fn [ci]
-                                     (let [dt (dtypes ci)]
-                                       (or (nil? (duckdb-ids ci))
-                                           (= dt :string))))
-                                   (range n-cols))
-                col-overrides (if needs-probe?
-                                (probe-col-overrides appender n-cols)
-                                {})
+                needs-probe?               (some (fn [ci]
+                                                   (let [dt (dtypes ci)]
+                                                     (or (nil? (duckdb-ids ci))
+                                                         (= dt :string))))
+                                                 (range n-cols))
+                col-overrides              (if needs-probe?
+                                             (probe-col-overrides appender n-cols)
+                                             {})
                 ;; Register every override's logical type for cleanup the
                 ;; moment we take ownership of it.
-                _ (doseq [ovr (vals col-overrides)]
-                    (.add cleanup-lts ^MemorySegment (:lt ovr)))
-                types-seg (.allocate setup-arena (* n-cols 8))
-                _ (dotimes [ci n-cols]
-                    (if-let [ovr (get col-overrides ci)]
-                      ;; Use appender's logical type (e.g. ENUM, DECIMAL)
-                      (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
-                      ;; Normal: create from dataset dtype — track for cleanup
-                      ;; before storing into the seg, so a throw between
-                      ;; create and store can't strand it.
-                      (let [^MemorySegment lt
-                            (ffi/duckdb_create_logical_type (int (duckdb-ids ci)))]
-                        (.add cleanup-lts lt)
-                        (.set types-seg ffi/VL-ADDR (long (* ci 8)) lt))))
+                _                          (doseq [ovr (vals col-overrides)]
+                                             (.add cleanup-lts ^MemorySegment (:lt ovr)))
+                types-seg                  (.allocate setup-arena (* n-cols 8))
+                _                          (dotimes [ci n-cols]
+                                             (if-let [ovr (get col-overrides ci)]
+                                               ;; Use appender's logical type (e.g. ENUM, DECIMAL)
+                                               (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
+                                               ;; Normal: create from dataset dtype — track for cleanup
+                                               ;; before storing into the seg, so a throw between
+                                               ;; create and store can't strand it.
+                                               (let [^MemorySegment lt
+                                                     (ffi/duckdb_create_logical_type (int (duckdb-ids ci)))]
+                                                 (.add cleanup-lts lt)
+                                                 (.set types-seg ffi/VL-ADDR (long (* ci 8)) lt))))
                 ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
                 ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
-                vecs (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %))
-                                        (range n-cols)))
+                vecs                       (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %))
+                                                              (range n-cols)))
                 ;; Extract logical-type addresses so we don't need types-seg later.
                 ;; (The arena holding types-seg closes when this fn returns.)
-                logical-types (mapv (fn [ci] (.get types-seg ffi/VL-ADDR (long (* ci 8))))
-                                    (range n-cols))]
+                logical-types              (mapv (fn [ci] (.get types-seg ffi/VL-ADDR (long (* ci 8))))
+                                                 (range n-cols))]
             {:appender      appender
              :write-chunk   write-chunk
              :vecs          vecs
@@ -829,46 +829,46 @@
   Returns the number of rows written."
   [^Arena arena state dataset]
   (let [{:keys [^MemorySegment appender ^MemorySegment write-chunk
-                ^objects vecs dtypes col-overrides]} state
-        n-cols      (count dtypes)
-        check-error (fn [status]
-                      (when-not (== (int status) ffi/DuckDBSuccess)
-                        (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
-                          (throw (Exception. (str "Appender error: " err))))))
-        n-rows      (ds/row-count dataset)
-        colvec      (vec (ds/columns dataset))
-        chunk-size  (ffi/duckdb_vector_size)
-        n-chunks    (long (Math/ceil (/ (double n-rows) chunk-size)))
+                ^objects vecs dtypes col-overrides]}               state
+        n-cols                                                     (count dtypes)
+        check-error                                                (fn [status]
+                                                                     (when-not (== (int status) ffi/DuckDBSuccess)
+                                                                       (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error appender))]
+                                                                         (throw (Exception. (str "Appender error: " err))))))
+        n-rows                                                     (ds/row-count dataset)
+        colvec                                                     (vec (ds/columns dataset))
+        chunk-size                                                 (ffi/duckdb_vector_size)
+        n-chunks                                                   (long (Math/ceil (/ (double n-rows) chunk-size)))
         ;; Pre-pack temporal columns once (not per-chunk)
-        prepped-cols (object-array
-                      (map-indexed
-                       (fn [ci col]
-                         (let [dt (dtypes ci)]
-                           (if (#{:local-date :local-time :instant} dt)
-                             (packing/pack col)
-                             col)))
-                       colvec))
+        prepped-cols                                               (object-array
+                                                                    (map-indexed
+                                                                     (fn [ci col]
+                                                                       (let [dt (dtypes ci)]
+                                                                         (if (#{:local-date :local-time :instant} dt)
+                                                                           (packing/pack col)
+                                                                           col)))
+                                                                     colvec))
         ;; Pre-resolve full-column missing bitmaps (avoid per-chunk ds/missing)
-        ^objects full-missings (object-array (map ds/missing colvec))]
+        ^objects full-missings                                     (object-array (map ds/missing colvec))]
     (dotimes [chunk-idx n-chunks]
       (let [row-off   (long (* chunk-idx chunk-size))
             row-count (long (min chunk-size (- n-rows row-off)))]
         (ffi/duckdb_data_chunk_set_size write-chunk row-count)
         (dotimes [col-idx n-cols]
-          (let [^MemorySegment dvec (aget vecs col-idx)
-                _                   (ffi/duckdb_vector_ensure_validity_writable dvec)
-                ^MemorySegment dp   (ffi/duckdb_vector_get_data dvec)
-                ^MemorySegment vp   (ffi/duckdb_vector_get_validity dvec)
-                col-dt  (dtypes col-idx)
+          (let [^MemorySegment dvec         (aget vecs col-idx)
+                _                           (ffi/duckdb_vector_ensure_validity_writable dvec)
+                ^MemorySegment dp           (ffi/duckdb_vector_get_data dvec)
+                ^MemorySegment vp           (ffi/duckdb_vector_get_validity dvec)
+                col-dt                      (dtypes col-idx)
                 ;; Clip full-column missing bitmap to this chunk's range
                 ^RoaringBitmap full-missing (aget full-missings col-idx)
-                chunk-missing (if (.isEmpty full-missing)
-                                full-missing
-                                (let [bm (RoaringBitmap/bitmapOfRange row-off (+ row-off row-count))]
-                                  (.and bm full-missing)
-                                  ;; Shift to 0-based for this chunk
-                                  (RoaringBitmap/addOffset bm (- row-off))))
-                subcol  (dt/sub-buffer (aget prepped-cols col-idx) row-off row-count)]
+                chunk-missing               (if (.isEmpty full-missing)
+                                              full-missing
+                                              (let [bm (RoaringBitmap/bitmapOfRange row-off (+ row-off row-count))]
+                                                (.and bm full-missing)
+                                                ;; Shift to 0-based for this chunk
+                                                (RoaringBitmap/addOffset bm (- row-off))))
+                subcol                      (dt/sub-buffer (aget prepped-cols col-idx) row-off row-count)]
             (write-validity! (.reinterpret vp (* (long (Math/ceil (/ (double row-count) 64))) 8))
                              chunk-missing
                              row-count)
@@ -946,7 +946,7 @@
       ;; the appender down regardless. Mirrors the poisoning logic in
       ;; `flush-appender!`.
       (let [^MemorySegment app (:appender state)
-            rc (ffi/duckdb_appender_flush app)]
+            rc                 (ffi/duckdb_appender_flush app)]
         (if (== (int rc) ffi/DuckDBSuccess)
           (destroy-appender-state! state)
           (let [err (ffi/read-c-str
@@ -1031,9 +1031,9 @@
   Returns `:ok` on success."
   [^Appender appender]
   (check-appender-open! appender)
-  (let [state (.-state appender)
+  (let [state              (.-state appender)
         ^MemorySegment app (:appender state)
-        rc    (ffi/duckdb_appender_flush app)]
+        rc                 (ffi/duckdb_appender_flush app)]
     (when-not (== (int rc) ffi/DuckDBSuccess)
       (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app))]
         ;; Poison: destroy state exactly once (CAS in close() will then no-op).
@@ -1054,6 +1054,12 @@
 (defmacro ^:private instr-time
   "Time `body`, accumulate ns into the LongAdder at `phase-kw` if instrumentation
   is enabled. When disabled, just runs body."
+  ;; `:style/indent 1` — CIDER's tool-agnostic indent spec. Emacs/CIDER and
+  ;; clojure-lsp (which forwards the value to cljfmt via clj-kondo analysis)
+  ;; will treat the first arg as a header and 2-indent body args. The same
+  ;; rule is duplicated in `.cljfmt.edn` so direct cljfmt CLI runs (CI, etc.)
+  ;; that bypass LSP still pick it up.
+  {:style/indent 1}
   [phase-kw & body]
   `(let [m# *instrument-stats*]
      (if (nil? m#)
@@ -1113,9 +1119,9 @@
   ^RoaringBitmap [^long n-rows ^MemorySegment nmask]
   (if (or (nil? nmask) (== 0 (.address nmask)))
     (bitmap/->bitmap)
-    (let [nvals (long (Math/ceil (/ (double n-rows) 64)))
+    (let [nvals              (long (Math/ceil (/ (double n-rows) 64)))
           ^MemorySegment seg (.reinterpret nmask (* nvals 8))
-          rval (bitmap/->bitmap)]
+          rval               (bitmap/->bitmap)]
       (dotimes [idx nvals]
         (let [lval (.get seg ffi/VL-LONG (long (* idx 8)))]
           (when-not (== lval -1)
@@ -1131,20 +1137,20 @@
 (def ^:private numeric-col-specs
   "Map from duckdb-type-map keyword → [byte-width native-dtype].
   Types here are handled by a single wrap-address + set-native-datatype path."
-  {:DUCKDB_TYPE_BOOLEAN   [1  :int8]   ;; post-processed via elemwise-cast
-   :DUCKDB_TYPE_TINYINT   [1  :int8]
-   :DUCKDB_TYPE_SMALLINT  [2  :int16]
-   :DUCKDB_TYPE_INTEGER   [4  :int32]
-   :DUCKDB_TYPE_BIGINT    [8  :int64]
-   :DUCKDB_TYPE_UTINYINT  [1  :uint8]
-   :DUCKDB_TYPE_USMALLINT [2  :uint16]
-   :DUCKDB_TYPE_UINTEGER  [4  :uint32]
-   :DUCKDB_TYPE_UBIGINT   [8  :uint64]
-   :DUCKDB_TYPE_FLOAT     [4  :float32]
-   :DUCKDB_TYPE_DOUBLE    [8  :float64]
-   :DUCKDB_TYPE_DATE      [4  :packed-local-date]
-   :DUCKDB_TYPE_TIME      [8  :packed-local-time]
-   :DUCKDB_TYPE_TIMESTAMP [8  :packed-instant]
+  {:DUCKDB_TYPE_BOOLEAN      [1  :int8]   ;; post-processed via elemwise-cast
+   :DUCKDB_TYPE_TINYINT      [1  :int8]
+   :DUCKDB_TYPE_SMALLINT     [2  :int16]
+   :DUCKDB_TYPE_INTEGER      [4  :int32]
+   :DUCKDB_TYPE_BIGINT       [8  :int64]
+   :DUCKDB_TYPE_UTINYINT     [1  :uint8]
+   :DUCKDB_TYPE_USMALLINT    [2  :uint16]
+   :DUCKDB_TYPE_UINTEGER     [4  :uint32]
+   :DUCKDB_TYPE_UBIGINT      [8  :uint64]
+   :DUCKDB_TYPE_FLOAT        [4  :float32]
+   :DUCKDB_TYPE_DOUBLE       [8  :float64]
+   :DUCKDB_TYPE_DATE         [4  :packed-local-date]
+   :DUCKDB_TYPE_TIME         [8  :packed-local-time]
+   :DUCKDB_TYPE_TIMESTAMP    [8  :packed-instant]
    :DUCKDB_TYPE_TIMESTAMP_TZ [8  :packed-instant]})
 
 (defn- nil-on-missing
@@ -1167,7 +1173,7 @@
     ;; Dense column: identity — no overhead, inner's own PClone (if any)
     ;; is preserved (e.g. UUID's tight Unsafe loop).
     inner
-    (let [n (.lsize inner)
+    (let [n  (.lsize inner)
           dt (.elemwiseDatatype inner)]
       (reify ObjectReader
         (elemwiseDatatype [_] dt)
@@ -1189,9 +1195,9 @@
 
 (defn- coldata->buffer
   [^RoaringBitmap missing n-rows type-info data-ptr ^MemorySegment vector-seg]
-  (let [n-rows (long n-rows)
+  (let [n-rows   (long n-rows)
         data-ptr (long data-ptr)
-        type-kw (:type-kw type-info)]
+        type-kw  (:type-kw type-info)]
     (if-let [[^long byte-width dtype] (get numeric-col-specs type-kw)]
       ;; Numeric / temporal — zero-copy wrap, dt/clone does memcpy
       (let [buf (-> (native-buffer/wrap-address data-ptr (* byte-width n-rows) nil)
@@ -1201,36 +1207,37 @@
       ;; Complex types
       (case type-kw
         :DUCKDB_TYPE_UUID
-        (let [base-addr data-ptr
+        (let [base-addr          data-ptr
               ^sun.misc.Unsafe u ffi/UNSAFE]
           ;; nil-on-missing returns this inner reader unchanged when there
           ;; are no nulls, so the optimized PClone (tight Unsafe loop) is
           ;; preserved on the dense path. On the sparse-null path the
           ;; wrapper's own PClone walks indices and skips missing slots.
-          (nil-on-missing missing
-            (reify
-              ObjectReader
-              (elemwiseDatatype [_] :uuid)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [addr (+ base-addr (* idx 16))]
-                  (UUID. (.getLong u (+ addr 8))
-                         (.getLong u addr))))
-              dt-proto/PClone
-              (clone [_]
-                ;; Reached only when missing is empty (wrapper-bypass path).
-                (let [^objects out (make-array UUID n-rows)]
-                  (dotimes [i n-rows]
-                    (let [addr (+ base-addr (* i 16))]
-                      (aset out (int i) (UUID. (.getLong u (+ addr 8))
-                                               (.getLong u addr)))))
-                  (hamf/wrap-array out))))))
+          (nil-on-missing
+           missing
+           (reify
+             ObjectReader
+             (elemwiseDatatype [_] :uuid)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [addr (+ base-addr (* idx 16))]
+                 (UUID. (.getLong u (+ addr 8))
+                        (.getLong u addr))))
+             dt-proto/PClone
+             (clone [_]
+               ;; Reached only when missing is empty (wrapper-bypass path).
+               (let [^objects out (make-array UUID n-rows)]
+                 (dotimes [i n-rows]
+                   (let [addr (+ base-addr (* i 16))]
+                     (aset out (int i) (UUID. (.getLong u (+ addr 8))
+                                              (.getLong u addr)))))
+                 (hamf/wrap-array out))))))
 
         :DUCKDB_TYPE_VARCHAR
         ;; Single reinterpreted segment for the whole string_t array — avoid per-element ofAddress
-        (let [base-addr data-ptr
+        (let [base-addr               data-ptr
               ^MemorySegment full-seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 n-rows))
-              has-missing? (not (.isEmpty missing))]
+              has-missing?            (not (.isEmpty missing))]
           (reify
             ObjectReader
             (elemwiseDatatype [_] :string)
@@ -1238,261 +1245,272 @@
             (readObject [_ idx]
               ;; NULL entries may have garbage string_t data — guard against it
               (when-not (and has-missing? (.contains missing (int idx)))
-                (let [off (long (* idx 16))
+                (let [off  (long (* idx 16))
                       slen (int (.get full-seg ffi/VL-INT off))]
                   (if (<= slen 12)
                     (let [arr (byte-array slen)]
                       (MemorySegment/copy full-seg ffi/VL-BYTE (+ off 4) arr 0 slen)
                       (String. arr "UTF-8"))
-                    (let [ptr-addr (.get full-seg ffi/VL-LONG (+ off 8))
+                    (let [ptr-addr               (.get full-seg ffi/VL-LONG (+ off 8))
                           ^MemorySegment ptr-seg (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
-                          arr (byte-array slen)]
+                          arr                    (byte-array slen)]
                       (MemorySegment/copy ptr-seg ffi/VL-BYTE (long 0) arr 0 slen)
                       (String. arr "UTF-8"))))))
             dt-proto/PClone
             (clone [_this]
               ;; Parallel decode via hamf/pgroups — each group works on a sub-range
-              (let [ne n-rows
+              (let [ne           n-rows
                     ^objects out (make-array String ne)]
                 (dorun
-                 (hamf/pgroups ne
-                               (if has-missing?
-                                 ;; Slow path: check missing per element
-                                 (fn [^long sidx ^long eidx]
-                                   (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
-                                                                          (* (- eidx sidx) 16))]
-                                     (dotimes [i (- eidx sidx)]
-                                       (when-not (.contains missing (int (+ sidx i)))
-                                         (let [off (long (* i 16))
-                                               slen (int (.get seg ffi/VL-INT off))]
-                                           (aset out (int (+ sidx i))
-                                                 (if (<= slen 12)
-                                                   (let [arr (byte-array slen)]
-                                                     (MemorySegment/copy seg ffi/VL-BYTE (+ off 4) arr 0 slen)
-                                                     (String. arr "UTF-8"))
-                                                   (let [ptr-addr (.get seg ffi/VL-LONG (+ off 8))
-                                                         ^MemorySegment ps (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
-                                                         arr (byte-array slen)]
-                                                     (MemorySegment/copy ps ffi/VL-BYTE (long 0) arr 0 slen)
-                                                     (String. arr "UTF-8")))))))))
-                                 ;; Fast path: no nulls — skip missing check entirely
-                                 (fn [^long sidx ^long eidx]
-                                   (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
-                                                                          (* (- eidx sidx) 16))]
-                                     (dotimes [i (- eidx sidx)]
-                                       (let [off (long (* i 16))
-                                             slen (int (.get seg ffi/VL-INT off))]
-                                         (aset out (int (+ sidx i))
-                                               (if (<= slen 12)
-                                                 (let [arr (byte-array slen)]
-                                                   (MemorySegment/copy seg ffi/VL-BYTE (+ off 4) arr 0 slen)
-                                                   (String. arr "UTF-8"))
-                                                 (let [ptr-addr (.get seg ffi/VL-LONG (+ off 8))
-                                                       ^MemorySegment ps (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
-                                                       arr (byte-array slen)]
-                                                   (MemorySegment/copy ps ffi/VL-BYTE (long 0) arr 0 slen)
-                                                   (String. arr "UTF-8")))))))))))
+                 (hamf/pgroups
+                  ne
+                  (if has-missing?
+                    ;; Slow path: check missing per element
+                    (fn [^long sidx ^long eidx]
+                      (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
+                                                             (* (- eidx sidx) 16))]
+                        (dotimes [i (- eidx sidx)]
+                          (when-not (.contains missing (int (+ sidx i)))
+                            (let [off  (long (* i 16))
+                                  slen (int (.get seg ffi/VL-INT off))]
+                              (aset out (int (+ sidx i))
+                                    (if (<= slen 12)
+                                      (let [arr (byte-array slen)]
+                                        (MemorySegment/copy seg ffi/VL-BYTE (+ off 4) arr 0 slen)
+                                        (String. arr "UTF-8"))
+                                      (let [ptr-addr          (.get seg ffi/VL-LONG (+ off 8))
+                                            ^MemorySegment ps (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
+                                            arr               (byte-array slen)]
+                                        (MemorySegment/copy ps ffi/VL-BYTE (long 0) arr 0 slen)
+                                        (String. arr "UTF-8")))))))))
+                    ;; Fast path: no nulls — skip missing check entirely
+                    (fn [^long sidx ^long eidx]
+                      (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress (+ base-addr (* sidx 16)))
+                                                             (* (- eidx sidx) 16))]
+                        (dotimes [i (- eidx sidx)]
+                          (let [off  (long (* i 16))
+                                slen (int (.get seg ffi/VL-INT off))]
+                            (aset out (int (+ sidx i))
+                                  (if (<= slen 12)
+                                    (let [arr (byte-array slen)]
+                                      (MemorySegment/copy seg ffi/VL-BYTE (+ off 4) arr 0 slen)
+                                      (String. arr "UTF-8"))
+                                    (let [ptr-addr          (.get seg ffi/VL-LONG (+ off 8))
+                                          ^MemorySegment ps (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
+                                          arr               (byte-array slen)]
+                                      (MemorySegment/copy ps ffi/VL-BYTE (long 0) arr 0 slen)
+                                      (String. arr "UTF-8")))))))))))
                 (hamf/wrap-array out)))))
 
         :DUCKDB_TYPE_TIMESTAMP_S
         ;; NULL-row safety handled by nil-on-missing wrapper.
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :instant)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (Instant/ofEpochSecond (.get seg ffi/VL-LONG (long (* idx 8))))))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :instant)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (Instant/ofEpochSecond (.get seg ffi/VL-LONG (long (* idx 8))))))))
 
         :DUCKDB_TYPE_TIMESTAMP_MS
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :instant)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (Instant/ofEpochMilli (.get seg ffi/VL-LONG (long (* idx 8))))))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :instant)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (Instant/ofEpochMilli (.get seg ffi/VL-LONG (long (* idx 8))))))))
 
         :DUCKDB_TYPE_TIMESTAMP_NS
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :instant)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [ns-val (.get seg ffi/VL-LONG (long (* idx 8)))
-                      secs (quot ns-val 1000000000)
-                      nanos (rem ns-val 1000000000)]
-                  (Instant/ofEpochSecond secs nanos))))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :instant)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [ns-val (.get seg ffi/VL-LONG (long (* idx 8)))
+                     secs   (quot ns-val 1000000000)
+                     nanos  (rem ns-val 1000000000)]
+                 (Instant/ofEpochSecond secs nanos))))))
 
         :DUCKDB_TYPE_HUGEINT
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [off (long (* idx 16))
-                      lower (.get seg ffi/VL-LONG off)
-                      upper (.get seg ffi/VL-LONG (+ off 8))
-                      lower-bi (if (neg? lower)
-                                 (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
-                                 (BigInteger/valueOf lower))]
-                  (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi))))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [off      (long (* idx 16))
+                     lower    (.get seg ffi/VL-LONG off)
+                     upper    (.get seg ffi/VL-LONG (+ off 8))
+                     lower-bi (if (neg? lower)
+                                (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
+                                (BigInteger/valueOf lower))]
+                 (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi))))))
 
         :DUCKDB_TYPE_BLOB
-        (let [base-addr data-ptr
+        (let [base-addr               data-ptr
               ^MemorySegment full-seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [off (long (* idx 16))
-                      slen (int (.get full-seg ffi/VL-INT off))]
-                  (if (<= slen 12)
-                    (let [arr (byte-array slen)]
-                      (MemorySegment/copy full-seg ffi/VL-BYTE (+ off 4) arr 0 slen)
-                      arr)
-                    (let [ptr-addr (.get full-seg ffi/VL-LONG (+ off 8))
-                          ^MemorySegment ptr-seg (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
-                          arr (byte-array slen)]
-                      (MemorySegment/copy ptr-seg ffi/VL-BYTE (long 0) arr 0 slen)
-                      arr)))))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [off  (long (* idx 16))
+                     slen (int (.get full-seg ffi/VL-INT off))]
+                 (if (<= slen 12)
+                   (let [arr (byte-array slen)]
+                     (MemorySegment/copy full-seg ffi/VL-BYTE (+ off 4) arr 0 slen)
+                     arr)
+                   (let [ptr-addr               (.get full-seg ffi/VL-LONG (+ off 8))
+                         ^MemorySegment ptr-seg (.reinterpret (MemorySegment/ofAddress ptr-addr) slen)
+                         arr                    (byte-array slen)]
+                     (MemorySegment/copy ptr-seg ffi/VL-BYTE (long 0) arr 0 slen)
+                     arr)))))))
 
         :DUCKDB_TYPE_INTERVAL
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [off (long (* idx 16))
-                      months (int (.get seg ffi/VL-INT off))
-                      days (int (.get seg ffi/VL-INT (+ off 4)))
-                      micros (.get seg ffi/VL-LONG (+ off 8))]
-                  {:months months :days days :micros micros})))))
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [off    (long (* idx 16))
+                     months (int (.get seg ffi/VL-INT off))
+                     days   (int (.get seg ffi/VL-INT (+ off 4)))
+                     micros (.get seg ffi/VL-LONG (+ off 8))]
+                 {:months months :days days :micros micros})))))
 
         :DUCKDB_TYPE_DECIMAL
-        (let [scale (long (:scale type-info))
+        (let [scale         (long (:scale type-info))
               internal-type (long (:internal-type type-info))
-              internal-kw (get ffi/duckdb-type-map internal-type)]
-          (nil-on-missing missing
-            (case internal-kw
-              :DUCKDB_TYPE_SMALLINT
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :object)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (BigDecimal/valueOf (long (.get seg ffi/VL-SHORT (long (* idx 2)))) (int scale)))))
-              :DUCKDB_TYPE_INTEGER
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :object)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (BigDecimal/valueOf (long (.get seg ffi/VL-INT (long (* idx 4)))) (int scale)))))
-              :DUCKDB_TYPE_BIGINT
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :object)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (BigDecimal/valueOf (.get seg ffi/VL-LONG (long (* idx 8))) (int scale)))))
-              :DUCKDB_TYPE_HUGEINT
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :object)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (let [off (long (* idx 16))
-                          lower (.get seg ffi/VL-LONG off)
-                          upper (.get seg ffi/VL-LONG (+ off 8))
-                          lower-bi (if (neg? lower)
-                                     (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
-                                     (BigInteger/valueOf lower))]
-                      (BigDecimal. ^BigInteger (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi)
-                                   (int scale))))))
-              (throw (RuntimeException. (str "Unsupported DECIMAL internal type: " internal-kw))))))
+              internal-kw   (get ffi/duckdb-type-map internal-type)]
+          (nil-on-missing
+           missing
+           (case internal-kw
+             :DUCKDB_TYPE_SMALLINT
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :object)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (BigDecimal/valueOf (long (.get seg ffi/VL-SHORT (long (* idx 2)))) (int scale)))))
+             :DUCKDB_TYPE_INTEGER
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :object)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (BigDecimal/valueOf (long (.get seg ffi/VL-INT (long (* idx 4)))) (int scale)))))
+             :DUCKDB_TYPE_BIGINT
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :object)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (BigDecimal/valueOf (.get seg ffi/VL-LONG (long (* idx 8))) (int scale)))))
+             :DUCKDB_TYPE_HUGEINT
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :object)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (let [off      (long (* idx 16))
+                         lower    (.get seg ffi/VL-LONG off)
+                         upper    (.get seg ffi/VL-LONG (+ off 8))
+                         lower-bi (if (neg? lower)
+                                    (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
+                                    (BigInteger/valueOf lower))]
+                     (BigDecimal. ^BigInteger (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi)
+                                  (int scale))))))
+             (throw (RuntimeException. (str "Unsupported DECIMAL internal type: " internal-kw))))))
 
         :DUCKDB_TYPE_ENUM
-        (let [dict (:enum-dict type-info)
+        (let [dict          (:enum-dict type-info)
               internal-type (long (:internal-type type-info))
-              internal-kw (get ffi/duckdb-type-map internal-type)]
-          (nil-on-missing missing
-            (case internal-kw
-              :DUCKDB_TYPE_UTINYINT
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) n-rows)]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :string)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (nth dict (Byte/toUnsignedInt (.get seg ffi/VL-BYTE (long idx)))))))
-              :DUCKDB_TYPE_USMALLINT
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :string)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (nth dict (Short/toUnsignedInt (.get seg ffi/VL-SHORT (long (* idx 2))))))))
-              :DUCKDB_TYPE_UINTEGER
-              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
-                (reify ObjectReader
-                  (elemwiseDatatype [_] :string)
-                  (lsize [_] n-rows)
-                  (readObject [_ idx]
-                    (nth dict (Integer/toUnsignedLong (.get seg ffi/VL-INT (long (* idx 4))))))))
-              (throw (RuntimeException. (str "Unsupported ENUM internal type: " internal-kw))))))
+              internal-kw   (get ffi/duckdb-type-map internal-type)]
+          (nil-on-missing
+           missing
+           (case internal-kw
+             :DUCKDB_TYPE_UTINYINT
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) n-rows)]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :string)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (nth dict (Byte/toUnsignedInt (.get seg ffi/VL-BYTE (long idx)))))))
+             :DUCKDB_TYPE_USMALLINT
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :string)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (nth dict (Short/toUnsignedInt (.get seg ffi/VL-SHORT (long (* idx 2))))))))
+             :DUCKDB_TYPE_UINTEGER
+             (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
+               (reify ObjectReader
+                 (elemwiseDatatype [_] :string)
+                 (lsize [_] n-rows)
+                 (readObject [_ idx]
+                   (nth dict (Integer/toUnsignedLong (.get seg ffi/VL-INT (long (* idx 4))))))))
+             (throw (RuntimeException. (str "Unsupported ENUM internal type: " internal-kw))))))
 
         :DUCKDB_TYPE_LIST
-        (let [^MemorySegment child-vec (ffi/duckdb_list_vector_get_child vector-seg)
-              child-size (ffi/duckdb_list_vector_get_size vector-seg)
-              ^MemorySegment child-data (ffi/duckdb_vector_get_data child-vec)
+        (let [^MemorySegment child-vec      (ffi/duckdb_list_vector_get_child vector-seg)
+              child-size                    (ffi/duckdb_list_vector_get_size vector-seg)
+              ^MemorySegment child-data     (ffi/duckdb_vector_get_data child-vec)
               ^MemorySegment child-validity (ffi/duckdb_vector_get_validity child-vec)
-              child-missing (validity->missing child-size child-validity)
-              child-buf (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
+              child-missing                 (validity->missing child-size child-validity)
+              child-buf                     (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
               ;; list_entry_t: offset (uint64) + length (uint64) = 16 bytes per entry
-              ^MemorySegment entry-seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [off (long (* idx 16))
-                      list-offset (.get entry-seg ffi/VL-LONG off)
-                      list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
-                  (mapv (fn [i]
-                          (let [ci (+ list-offset i)]
-                            (if (.contains ^RoaringBitmap child-missing (int ci))
-                              nil
-                              (child-buf ci))))
-                        (range list-length)))))))
+              ^MemorySegment entry-seg      (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [off         (long (* idx 16))
+                     list-offset (.get entry-seg ffi/VL-LONG off)
+                     list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
+                 (mapv (fn [i]
+                         (let [ci (+ list-offset i)]
+                           (if (.contains ^RoaringBitmap child-missing (int ci))
+                             nil
+                             (child-buf ci))))
+                       (range list-length)))))))
 
         :DUCKDB_TYPE_MAP
         ;; MAP is internally LIST<STRUCT{key, value}>
-        (let [^MemorySegment child-vec (ffi/duckdb_list_vector_get_child vector-seg)
-              child-size (ffi/duckdb_list_vector_get_size vector-seg)
-              ^MemorySegment child-data (ffi/duckdb_vector_get_data child-vec)
+        (let [^MemorySegment child-vec      (ffi/duckdb_list_vector_get_child vector-seg)
+              child-size                    (ffi/duckdb_list_vector_get_size vector-seg)
+              ^MemorySegment child-data     (ffi/duckdb_vector_get_data child-vec)
               ^MemorySegment child-validity (ffi/duckdb_vector_get_validity child-vec)
-              child-missing (validity->missing child-size child-validity)
-              child-buf (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
-              ^MemorySegment entry-seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (let [off (long (* idx 16))
-                      list-offset (.get entry-seg ffi/VL-LONG off)
-                      list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
-                  (persistent!
-                   (reduce (fn [m i]
-                             (let [ci (+ list-offset i)
-                                   entry (child-buf ci)]
-                               (assoc! m (:key entry) (:value entry))))
-                           (transient {})
-                           (range list-length))))))))
+              child-missing                 (validity->missing child-size child-validity)
+              child-buf                     (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
+              ^MemorySegment entry-seg      (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (let [off         (long (* idx 16))
+                     list-offset (.get entry-seg ffi/VL-LONG off)
+                     list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
+                 (persistent!
+                  (reduce (fn [m i]
+                            (let [ci    (+ list-offset i)
+                                  entry (child-buf ci)]
+                              (assoc! m (:key entry) (:value entry))))
+                          (transient {})
+                          (range list-length))))))))
 
         :DUCKDB_TYPE_STRUCT
         ;; STRUCT has no outer-row missing bitmap of its own at this layer
@@ -1504,28 +1522,29 @@
         (let [child-count (long (:child-count type-info))
               child-names (:child-names type-info)
               child-types (:child-types type-info)
-              children (mapv (fn [ci]
-                               (let [^MemorySegment cvec (ffi/duckdb_struct_vector_get_child vector-seg (long ci))
-                                     ^MemorySegment cdata (ffi/duckdb_vector_get_data cvec)
-                                     ^MemorySegment cvalid (ffi/duckdb_vector_get_validity cvec)
-                                     cmissing (validity->missing n-rows cvalid)]
-                                 {:buf (coldata->buffer cmissing n-rows (child-types ci) (.address cdata) cvec)
-                                  :missing cmissing
-                                  :name (keyword (child-names ci))}))
-                             (range child-count))]
-          (nil-on-missing missing
-            (reify ObjectReader
-              (elemwiseDatatype [_] :object)
-              (lsize [_] n-rows)
-              (readObject [_ idx]
-                (persistent!
-                 (reduce (fn [m {:keys [buf missing name]}]
-                           (assoc! m name
-                                   (if (.contains ^RoaringBitmap missing (int idx))
-                                     nil
-                                     (buf idx))))
-                         (transient {})
-                         children))))))
+              children    (mapv (fn [ci]
+                                  (let [^MemorySegment cvec   (ffi/duckdb_struct_vector_get_child vector-seg (long ci))
+                                        ^MemorySegment cdata  (ffi/duckdb_vector_get_data cvec)
+                                        ^MemorySegment cvalid (ffi/duckdb_vector_get_validity cvec)
+                                        cmissing              (validity->missing n-rows cvalid)]
+                                    {:buf     (coldata->buffer cmissing n-rows (child-types ci) (.address cdata) cvec)
+                                     :missing cmissing
+                                     :name    (keyword (child-names ci))}))
+                                (range child-count))]
+          (nil-on-missing
+           missing
+           (reify ObjectReader
+             (elemwiseDatatype [_] :object)
+             (lsize [_] n-rows)
+             (readObject [_ idx]
+               (persistent!
+                (reduce (fn [m {:keys [buf missing name]}]
+                          (assoc! m name
+                                  (if (.contains ^RoaringBitmap missing (int idx))
+                                    nil
+                                    (buf idx))))
+                        (transient {})
+                        children))))))
 
         (throw (RuntimeException. (format "Unsupported column type: %s" type-kw)))))))
 
@@ -1624,8 +1643,8 @@
   "Extract type metadata from a DuckDB logical type.
   Returns a map with :type-id, :type-kw, and type-specific keys."
   [^MemorySegment lt]
-  (let [tid (ffi/duckdb_get_type_id lt)
-        tkw (get ffi/duckdb-type-map tid)
+  (let [tid  (ffi/duckdb_get_type_id lt)
+        tkw  (get ffi/duckdb-type-map tid)
         base {:type-id tid :type-kw tkw}]
     (case tkw
       :DUCKDB_TYPE_DECIMAL
@@ -1636,39 +1655,39 @@
 
       :DUCKDB_TYPE_ENUM
       (let [dict-size (ffi/duckdb_enum_dictionary_size lt)
-            dict (mapv (fn [i]
-                         (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
-                               v (ffi/read-c-str s)]
-                           (ffi/duckdb_free s)
-                           v))
-                       (range dict-size))]
+            dict      (mapv (fn [i]
+                              (let [^MemorySegment s (ffi/duckdb_enum_dictionary_value lt (long i))
+                                    v                (ffi/read-c-str s)]
+                                (ffi/duckdb_free s)
+                                v))
+                            (range dict-size))]
         (assoc base
                :enum-dict dict
                :internal-type (ffi/duckdb_enum_internal_type lt)))
 
       :DUCKDB_TYPE_LIST
       (let [^MemorySegment child-lt (ffi/duckdb_list_type_child_type lt)
-            child-info (extract-type-info child-lt)]
+            child-info              (extract-type-info child-lt)]
         (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
         (assoc base :child-type child-info))
 
       :DUCKDB_TYPE_MAP
       (let [^MemorySegment child-lt (ffi/duckdb_list_type_child_type lt)
-            child-info (extract-type-info child-lt)]
+            child-info              (extract-type-info child-lt)]
         (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
         (assoc base :child-type child-info))
 
       :DUCKDB_TYPE_STRUCT
-      (let [n (ffi/duckdb_struct_type_child_count lt)
-            names (mapv (fn [i]
-                          (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
-                                v (ffi/read-c-str s)]
-                            (ffi/duckdb_free s)
-                            v))
-                        (range n))
+      (let [n           (ffi/duckdb_struct_type_child_count lt)
+            names       (mapv (fn [i]
+                                (let [^MemorySegment s (ffi/duckdb_struct_type_child_name lt (long i))
+                                      v                (ffi/read-c-str s)]
+                                  (ffi/duckdb_free s)
+                                  v))
+                              (range n))
             child-infos (mapv (fn [i]
                                 (let [^MemorySegment clt (ffi/duckdb_struct_type_child_type lt (long i))
-                                      ci (extract-type-info clt)]
+                                      ci                 (extract-type-info clt)]
                                   (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type clt)
                                   ci))
                               (range n))]
@@ -1679,8 +1698,8 @@
 
       :DUCKDB_TYPE_ARRAY
       (let [^MemorySegment child-lt (ffi/duckdb_array_type_child_type lt)
-            child-info (extract-type-info child-lt)
-            arr-size (ffi/duckdb_array_type_array_size lt)]
+            child-info              (extract-type-info child-lt)
+            arr-size                (ffi/duckdb_array_type_array_size lt)]
         (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type child-lt)
         (assoc base :child-type child-info :array-size arr-size))
 
@@ -1689,49 +1708,49 @@
 
 (defn- results->datasets
   ^AutoCloseable [sql result-seg destroy-result* options]
-  (let [n-cols (ffi/duckdb_column_count result-seg)
-        names (mapv (fn [i] (ffi/read-c-str ^MemorySegment (ffi/duckdb_column_name result-seg (long i)))) (range n-cols))
-        type-infos (mapv (fn [i]
-                           (let [^MemorySegment lt (ffi/duckdb_column_logical_type result-seg (long i))
-                                 info (extract-type-info lt)]
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type lt)
-                             info))
-                         (range n-cols))
-        key-fn (get options :key-fn identity)
-        realize-chunk (fn [^MemorySegment data-chunk clone?]
-                        (instr-time :realize-wallclock-ns
-                         (let [n-rows (ffi/duckdb_data_chunk_get_size data-chunk)
-                               colmap (hamf/mut-map)
-                               ;; Build delays that construct the Column. Each future runs
-                               ;; clone eagerly in the agent pool, so cloning across columns
-                               ;; overlaps. Forcing them via mapv deref awaits all in parallel.
-                               columns
-                               (hamf/mapv
-                                (fn [cidx]
-                                  (instr-inc! :columns)
-                                  (let [^MemorySegment vdata (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
-                                        ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
-                                        ^MemorySegment val-ptr (ffi/duckdb_vector_get_validity vdata)
-                                        missing (instr-time :validity-ns
-                                                  (validity->missing n-rows val-ptr))
-                                        coldata (instr-time :buffer-ns
-                                                  (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata))
-                                        cname (key-fn (names cidx))
-                                        delayed-data (if clone?
-                                                       (do (instr-inc! :clones)
-                                                           (future (instr-time :clone-cpu-ns
-                                                                     (dt/clone coldata))))
-                                                       (delay coldata))]
-                                    (.put colmap cname cidx)
-                                    (delay (Column. missing @delayed-data {:name cname} nil))))
-                                (hamf/range n-cols))
-                               col-data (instr-time :deref-wait-ns
-                                          (hamf/mapv deref columns))]
-                           (Dataset. col-data
-                                     (persistent! colmap)
-                                     {:name :_unnamed}
-                                     0 0))))
-        reduce-type (get options :reduce-type :clone)
+  (let [n-cols          (ffi/duckdb_column_count result-seg)
+        names           (mapv (fn [i] (ffi/read-c-str ^MemorySegment (ffi/duckdb_column_name result-seg (long i)))) (range n-cols))
+        type-infos      (mapv (fn [i]
+                                (let [^MemorySegment lt (ffi/duckdb_column_logical_type result-seg (long i))
+                                      info              (extract-type-info lt)]
+                                  (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type lt)
+                                  info))
+                              (range n-cols))
+        key-fn          (get options :key-fn identity)
+        realize-chunk   (fn [^MemorySegment data-chunk clone?]
+                          (instr-time :realize-wallclock-ns
+                            (let [n-rows   (ffi/duckdb_data_chunk_get_size data-chunk)
+                                  colmap   (hamf/mut-map)
+                                  ;; Build delays that construct the Column. Each future runs
+                                  ;; clone eagerly in the agent pool, so cloning across columns
+                                  ;; overlaps. Forcing them via mapv deref awaits all in parallel.
+                                  columns
+                                  (hamf/mapv
+                                   (fn [cidx]
+                                     (instr-inc! :columns)
+                                     (let [^MemorySegment vdata    (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
+                                           ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
+                                           ^MemorySegment val-ptr  (ffi/duckdb_vector_get_validity vdata)
+                                           missing                 (instr-time :validity-ns
+                                                                     (validity->missing n-rows val-ptr))
+                                           coldata                 (instr-time :buffer-ns
+                                                                     (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata))
+                                           cname                   (key-fn (names cidx))
+                                           delayed-data            (if clone?
+                                                                     (do (instr-inc! :clones)
+                                                                         (future (instr-time :clone-cpu-ns
+                                                                                   (dt/clone coldata))))
+                                                                     (delay coldata))]
+                                       (.put colmap cname cidx)
+                                       (delay (Column. missing @delayed-data {:name cname} nil))))
+                                   (hamf/range n-cols))
+                                  col-data (instr-time :deref-wait-ns
+                                             (hamf/mapv deref columns))]
+                              (Dataset. col-data
+                                        (persistent! colmap)
+                                        {:name :_unnamed}
+                                        0 0))))
+        reduce-type     (get options :reduce-type :clone)
         ;; Allocate the retain list only when needed — keeps the common
         ;; `:clone` / `:zero-copy` paths allocation-free.
         retained-chunks (when (= reduce-type :zero-copy-retain)
@@ -1772,10 +1791,10 @@
   happen at the storage level (no per-element packing/unpacking dispatch),
   while the target container is allocated at the logical dtype so reads
   auto-unpack downstream."
-  {:int8 :int8, :uint8 :int8, :boolean :int8
-   :int16 :int16, :uint16 :int16
-   :int32 :int32, :uint32 :int32, :packed-local-date :int32
-   :int64 :int64, :uint64 :int64, :packed-local-time :int64, :packed-instant :int64
+  {:int8    :int8,   :uint8  :int8,  :boolean           :int8
+   :int16   :int16,  :uint16 :int16
+   :int32   :int32,  :uint32 :int32, :packed-local-date :int32
+   :int64   :int64,  :uint64 :int64, :packed-local-time :int64, :packed-instant :int64
    :float32 :float32
    :float64 :float64})
 
@@ -1797,22 +1816,22 @@
   body — Clojure's primitive-arg fn limit is 4, and we already pay 8 here."
   [dsdata col-idx col-name col-meta dtype total-rows
    ^longs row-counts ^longs offsets]
-  (let [col-idx (long col-idx)
-        total-rows (long total-rows)
-        n-chunks (count dsdata)
-        storage-dt (dtype->storage-dtype dtype)
-        target (dt/make-container :jvm-heap dtype total-rows)
+  (let [col-idx     (long col-idx)
+        total-rows  (long total-rows)
+        n-chunks    (count dsdata)
+        storage-dt  (dtype->storage-dtype dtype)
+        target      (dt/make-container :jvm-heap dtype total-rows)
         missing-acc (bitmap/->bitmap)]
     (dotimes [chunk-idx n-chunks]
-      (let [ds (dsdata chunk-idx)
-            ^Column col (nth (ds/columns ds) col-idx)
+      (let [ds                         (dsdata chunk-idx)
+            ^Column col                (nth (ds/columns ds) col-idx)
             ;; Re-tag source NativeBuffer to storage dtype to bypass packing.
             ;; The underlying native memory layout is unchanged; we just
             ;; change how dt/copy! sees the element type.
-            src (native-buffer/set-native-datatype (.data col) storage-dt)
+            src                        (native-buffer/set-native-datatype (.data col) storage-dt)
             ^RoaringBitmap src-missing (.missing col)
-            n (aget row-counts chunk-idx)
-            off (aget offsets chunk-idx)]
+            n                          (aget row-counts chunk-idx)
+            off                        (aget offsets chunk-idx)]
         (dt/copy! src (dt/sub-buffer target off n))
         (when-not (.isEmpty src-missing)
           (.or missing-acc ^RoaringBitmap (bitmap/offset src-missing off)))))
@@ -1827,62 +1846,62 @@
   results take the existing dt/clone shortcut."
   [^AutoCloseable results]
   (instr-time :concat-ns
-   (let [dsdata (vec results)
-         n-chunks (count dsdata)]
-     (cond
-       (empty? dsdata) nil
-       (== 1 n-chunks) (dt/clone (dsdata 0))
-       :else
-       (let [ds0 (dsdata 0)
-             cols0 (vec (ds/columns ds0))
-             n-cols (count cols0)
-             col-dtypes (mapv dt/elemwise-datatype cols0)
-             col-names (mapv (comp :name meta) cols0)
-             col-metas (mapv meta cols0)
-             numeric-idxs (filterv #(fast-concat-numeric-dtypes (col-dtypes %))
-                                   (range n-cols))
-             n-numeric (count numeric-idxs)]
-         (if (or (< n-numeric 2) (< n-chunks 8))
-           ;; Heuristic guards — not worth the parallel-dispatch overhead
-           (apply ds/concat dsdata)
-           (let [other-idxs (vec (remove (set numeric-idxs) (range n-cols)))
-                 n-other (count other-idxs)
-                 row-counts (long-array (map ds/row-count dsdata))
-                 total-rows (long (reduce + row-counts))
-                 ;; Cumulative offsets: offsets[i] = sum of row-counts[0..i-1]
-                 offsets (let [a (long-array (inc n-chunks))]
-                           (dotimes [i n-chunks]
-                             (aset a (inc i) (+ (aget a i) (aget row-counts i))))
-                           a)
-                 ;; Start non-numeric concat on a worker thread.  Overlaps the
-                 ;; non-numeric work with our numeric pmap; cheap insurance even
-                 ;; when the string concat dominates the critical path.
-                 other-cols-fut
-                 (when (pos? n-other)
-                   (future
-                     (let [other-names (mapv col-names other-idxs)
-                           projected (mapv #(ds/select-columns % other-names) dsdata)]
-                       (vec (ds/columns (apply ds/concat projected))))))
-                 ;; Parallel-memcpy each numeric column across cores
-                 numeric-cols
-                 (vec (hamf/pmap
-                       (fn [^long ni]
-                         (let [cidx (long (numeric-idxs ni))]
-                           (concat-numeric-col dsdata cidx
-                                               (col-names cidx) (col-metas cidx)
-                                               (col-dtypes cidx) total-rows
-                                               row-counts offsets)))
-                       (range n-numeric)))
-                 other-cols (when other-cols-fut @other-cols-fut)
-                 ;; Stitch numeric + other back into original column order
-                 numeric-pos (zipmap numeric-idxs (range))
-                 other-pos   (zipmap other-idxs   (range))
-                 merged-cols (mapv (fn [cidx]
-                                     (if-let [ni (numeric-pos cidx)]
-                                       (numeric-cols ni)
-                                       (other-cols (other-pos cidx))))
-                                   (range n-cols))]
-             (ds/new-dataset (ds/dataset-name ds0) merged-cols))))))))
+    (let [dsdata   (vec results)
+          n-chunks (count dsdata)]
+      (cond
+        (empty? dsdata) nil
+        (== 1 n-chunks) (dt/clone (dsdata 0))
+        :else
+        (let [ds0          (dsdata 0)
+              cols0        (vec (ds/columns ds0))
+              n-cols       (count cols0)
+              col-dtypes   (mapv dt/elemwise-datatype cols0)
+              col-names    (mapv (comp :name meta) cols0)
+              col-metas    (mapv meta cols0)
+              numeric-idxs (filterv #(fast-concat-numeric-dtypes (col-dtypes %))
+                                    (range n-cols))
+              n-numeric    (count numeric-idxs)]
+          (if (or (< n-numeric 2) (< n-chunks 8))
+            ;; Heuristic guards — not worth the parallel-dispatch overhead
+            (apply ds/concat dsdata)
+            (let [other-idxs  (vec (remove (set numeric-idxs) (range n-cols)))
+                  n-other     (count other-idxs)
+                  row-counts  (long-array (map ds/row-count dsdata))
+                  total-rows  (long (reduce + row-counts))
+                  ;; Cumulative offsets: offsets[i] = sum of row-counts[0..i-1]
+                  offsets     (let [a (long-array (inc n-chunks))]
+                                (dotimes [i n-chunks]
+                                  (aset a (inc i) (+ (aget a i) (aget row-counts i))))
+                                a)
+                  ;; Start non-numeric concat on a worker thread.  Overlaps the
+                  ;; non-numeric work with our numeric pmap; cheap insurance even
+                  ;; when the string concat dominates the critical path.
+                  other-cols-fut
+                  (when (pos? n-other)
+                    (future
+                      (let [other-names (mapv col-names other-idxs)
+                            projected   (mapv #(ds/select-columns % other-names) dsdata)]
+                        (vec (ds/columns (apply ds/concat projected))))))
+                  ;; Parallel-memcpy each numeric column across cores
+                  numeric-cols
+                  (vec (hamf/pmap
+                        (fn [^long ni]
+                          (let [cidx (long (numeric-idxs ni))]
+                            (concat-numeric-col dsdata cidx
+                                                (col-names cidx) (col-metas cidx)
+                                                (col-dtypes cidx) total-rows
+                                                row-counts offsets)))
+                        (range n-numeric)))
+                  other-cols  (when other-cols-fut @other-cols-fut)
+                  ;; Stitch numeric + other back into original column order
+                  numeric-pos (zipmap numeric-idxs (range))
+                  other-pos   (zipmap other-idxs   (range))
+                  merged-cols (mapv (fn [cidx]
+                                      (if-let [ni (numeric-pos cidx)]
+                                        (numeric-cols ni)
+                                        (other-cols (other-pos cidx))))
+                                    (range n-cols))]
+              (ds/new-dataset (ds/dataset-name ds0) merged-cols))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 12. Prepared statements
@@ -1896,9 +1915,9 @@
     (float? v) (ffi/duckdb_bind_double stmt idx (double v))
     (double? v) (ffi/duckdb_bind_double stmt idx (double v))
     (string? v) (let [^bytes bval (.getBytes ^String v "UTF-8")
-                      seg (let [s (.allocate arena (alength bval))]
-                            (MemorySegment/copy bval 0 s ffi/VL-BYTE 0 (alength bval))
-                            s)]
+                      seg         (let [s (.allocate arena (alength bval))]
+                                    (MemorySegment/copy bval 0 s ffi/VL-BYTE 0 (alength bval))
+                                    s)]
                   (ffi/duckdb_bind_varchar_length stmt idx seg (long (alength bval))))
     (instance? LocalDate v) (ffi/duckdb_bind_date stmt idx (int (.toEpochDay ^LocalDate v)))
     (instance? LocalTime v) (ffi/duckdb_bind_time stmt idx (long (quot (.toNanoOfDay ^LocalTime v) 1000)))
@@ -1937,51 +1956,51 @@
 (defn prepare
   (^AutoCloseable [^long conn ^String sql] (prepare conn sql nil))
   (^AutoCloseable [^long conn ^String sql options]
-   (let [arena (Arena/ofConfined)
-         conn-seg (MemorySegment/ofAddress conn)
-         stmt-ptr (.allocate arena ffi/VL-ADDR)
-         rc (ffi/duckdb_prepare conn-seg (ffi/alloc-c-str arena sql) stmt-ptr)
+   (let [arena               (Arena/ofConfined)
+         conn-seg            (MemorySegment/ofAddress conn)
+         stmt-ptr            (.allocate arena ffi/VL-ADDR)
+         rc                  (ffi/duckdb_prepare conn-seg (ffi/alloc-c-str arena sql) stmt-ptr)
          ^MemorySegment stmt (.get stmt-ptr ffi/VL-ADDR 0)
-         destroy-prep* (delay
-                         (ffi/destroy-ptr! ffi/duckdb_destroy_prepare stmt)
-                         (.close arena))
-         _ (when-not (== rc 0)
-             (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_prepare_error stmt))]
-               @destroy-prep*
-               (throw (RuntimeException. (str "Error preparing: " err)))))
-         result-type (get options :result-type :streaming)
+         destroy-prep*       (delay
+                               (ffi/destroy-ptr! ffi/duckdb_destroy_prepare stmt)
+                               (.close arena))
+         _                   (when-not (== rc 0)
+                               (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_prepare_error stmt))]
+                                 @destroy-prep*
+                                 (throw (RuntimeException. (str "Error preparing: " err)))))
+         result-type         (get options :result-type :streaming)
          finalize-stmt
          (fn []
            (let [pend-arena (Arena/ofConfined)]
              (try
-               (let [pending-ptr (.allocate pend-arena ffi/VL-ADDR)
-                     prc (ffi/duckdb_pending_prepared stmt pending-ptr)
+               (let [pending-ptr            (.allocate pend-arena ffi/VL-ADDR)
+                     prc                    (ffi/duckdb_pending_prepared stmt pending-ptr)
                      ^MemorySegment pending (.get pending-ptr ffi/VL-ADDR 0)
-                     _ (when-not (== prc 0)
-                         (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
-                                       "Unknown Error")]
-                           (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                           (throw (RuntimeException. (str "Pending error: " err)))))
-                     result-seg (.allocate pend-arena (.byteSize ^MemoryLayout ffi/result-layout))
-                     erc (ffi/duckdb_execute_pending pending result-seg)
-                     _ (when-not (== erc 0)
-                         (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
-                                       "Unknown Error")]
-                           (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                           (ffi/duckdb_destroy_result result-seg)
-                           (throw (RuntimeException. (str "Execute error: " err)))))
-                     _ (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                     destroy-result* (delay (ffi/duckdb_destroy_result result-seg)
-                                            (.close pend-arena))
-                     opts (if (= result-type :single)
-                            ;; `:single` materializes inside
-                            ;; `datasets->dataset` (parallel-memcpy fast
-                            ;; path needs every chunk alive at once); use
-                            ;; the retain mode so chunks live until the
-                            ;; ResultChunks closes, instead of leaking.
-                            (assoc options :reduce-type :zero-copy-retain)
-                            options)
-                     res-data (results->datasets sql result-seg destroy-result* opts)]
+                     _                      (when-not (== prc 0)
+                                              (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
+                                                            "Unknown Error")]
+                                                (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
+                                                (throw (RuntimeException. (str "Pending error: " err)))))
+                     result-seg             (.allocate pend-arena (.byteSize ^MemoryLayout ffi/result-layout))
+                     erc                    (ffi/duckdb_execute_pending pending result-seg)
+                     _                      (when-not (== erc 0)
+                                              (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
+                                                            "Unknown Error")]
+                                                (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
+                                                (ffi/duckdb_destroy_result result-seg)
+                                                (throw (RuntimeException. (str "Execute error: " err)))))
+                     _                      (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
+                     destroy-result*        (delay (ffi/duckdb_destroy_result result-seg)
+                                                   (.close pend-arena))
+                     opts                   (if (= result-type :single)
+                                              ;; `:single` materializes inside
+                                              ;; `datasets->dataset` (parallel-memcpy fast
+                                              ;; path needs every chunk alive at once); use
+                                              ;; the retain mode so chunks live until the
+                                              ;; ResultChunks closes, instead of leaking.
+                                              (assoc options :reduce-type :zero-copy-retain)
+                                              options)
+                     res-data               (results->datasets sql result-seg destroy-result* opts)]
                  (case result-type
                    :streaming res-data
                    :realized res-data
@@ -1990,8 +2009,8 @@
                (catch Exception e
                  (try (.close pend-arena) (catch IllegalStateException _))
                  (throw e)))))
-         n-params (ffi/duckdb_nparams stmt)
-         param-types (mapv #(ffi/duckdb_param_type stmt (long (inc %))) (range n-params))]
+         n-params            (ffi/duckdb_nparams stmt)
+         param-types         (mapv #(ffi/duckdb_param_type stmt (long (inc %))) (range n-params))]
      (case (int n-params)
        0 (PrepStatement0. sql destroy-prep* finalize-stmt)
        1 (PrepStatement1. sql stmt param-types destroy-prep* finalize-stmt)

@@ -34,16 +34,16 @@
 
 (defn supported-datatype-ds
   []
-  (-> (ds/->dataset {:boolean [true false true true false false true false false true]
-                     :bytes (byte-array (range 10))
-                     :shorts (short-array (range 10))
-                     :ints (int-array (range 10))
-                     :longs (long-array (range 10))
-                     :floats (float-array (range 10))
-                     :doubles (double-array (range 10))
-                     :strings (map str (range 10))
-                     :uuids (repeatedly 10 #(UUID/randomUUID))
-                     :instants (repeatedly 10 dtype-dt/instant)
+  (-> (ds/->dataset {:boolean     [true false true true false false true false false true]
+                     :bytes       (byte-array (range 10))
+                     :shorts      (short-array (range 10))
+                     :ints        (int-array (range 10))
+                     :longs       (long-array (range 10))
+                     :floats      (float-array (range 10))
+                     :doubles     (double-array (range 10))
+                     :strings     (map str (range 10))
+                     :uuids       (repeatedly 10 #(UUID/randomUUID))
+                     :instants    (repeatedly 10 dtype-dt/instant)
                      :local_dates (repeatedly 10 dtype-dt/local-date)
                      :local_times (->> (repeatedly 10 dtype-dt/local-time))})
       (vary-meta assoc
@@ -66,14 +66,14 @@
 
 (defonce stocks-src* (delay
                        (ds/->dataset "https://github.com/techascent/tech.ml.dataset/raw/master/test/data/stocks.csv"
-                                     {:key-fn keyword
+                                     {:key-fn       keyword
                                       :dataset-name :stocks})))
 
 (deftest basic-stocks-test
   (try
-    (let [stocks @stocks-src*
-          _ (do (duck/create-table! @conn* stocks)
-                (duck/insert-dataset! @conn* stocks))
+    (let [stocks     @stocks-src*
+          _          (do (duck/create-table! @conn* stocks)
+                         (duck/insert-dataset! @conn* stocks))
           sql-stocks (duck/sql->dataset @conn* "select * from stocks")]
       (is (= (ds/row-count stocks)
              (ds/row-count sql-stocks)))
@@ -96,8 +96,8 @@
                                    :else m)))
                    (vary-meta assoc :name :stonks))]
     (try
-      (do (duck/create-table! @conn* stonks)
-          (duck/insert-dataset! @conn* stonks))
+      (duck/create-table! @conn* stonks)
+      (duck/insert-dataset! @conn* stonks)
       (let [sql-stocks (duck/sql->dataset @conn* "select * from stonks")]
         (is (= (ds/row-count stonks)
                (ds/row-count sql-stocks)))
@@ -117,8 +117,8 @@
 (deftest prepared-statements-test
   (try
     (let [stocks @stocks-src*
-          _ (do (duck/create-table! @conn* stocks)
-                (duck/insert-dataset! @conn* stocks))]
+          _      (do (duck/create-table! @conn* stocks)
+                     (duck/insert-dataset! @conn* stocks))]
       (resource/stack-resource-context
        (let [prep-stmt (duck/prepare @conn* "select * from stocks" {:result-type :single})]
          (is (== 560 (ds/row-count (prep-stmt))) "single")))
@@ -136,11 +136,11 @@
 
 (deftest missing-instant-test
   (try
-    (let [ds (-> (ds/->dataset {:a [1 2 nil 4 nil 6]
-                                :b [(dtype-dt/instant) nil nil (dtype-dt/instant) nil (dtype-dt/instant)]})
-                 (vary-meta assoc :name "testdb"))
-          _ (do (duck/create-table! @conn* ds)
-                (duck/insert-dataset! @conn* ds))
+    (let [ds     (-> (ds/->dataset {:a [1 2 nil 4 nil 6]
+                                    :b [(dtype-dt/instant) nil nil (dtype-dt/instant) nil (dtype-dt/instant)]})
+                     (vary-meta assoc :name "testdb"))
+          _      (do (duck/create-table! @conn* ds)
+                     (duck/insert-dataset! @conn* ds))
           sql-ds (duck/sql->dataset @conn* "select * from testdb" {:key-fn keyword})]
       (is (= (ds/missing ds)
              (ds/missing sql-ds)))
@@ -154,8 +154,8 @@
         (catch Throwable _e nil)))))
 
 (deftest insert-test
-  (let [cn 4
-        rn 1024
+  (let [cn    4
+        rn    1024
         ds-fn #(-> (into {} (for [i (range cn)] [(str "c" i)
                                                  (for [_ (range rn)] (str (random-uuid)))]))
                    (ds/->dataset {:dataset-name "t"})
@@ -170,8 +170,8 @@
                         (ds/row-count))))))
 
 (deftest insert-chunk-size-test
-  (let [cn 4
-        rn (ffi/duckdb_vector_size)
+  (let [cn    4
+        rn    (ffi/duckdb_vector_size)
         ds-fn #(-> (into {} (for [i (range cn)] [(str "c" i)
                                                  (for [_ (range rn)] (random-uuid))]))
                    (ds/->dataset {:dataset-name "t"})
@@ -213,7 +213,7 @@
       (testing "write"
         (duck/run-query! cn "CREATE TABLE ts_tz_w (val TIMESTAMPTZ)")
         (let [instants [(Instant/parse "2024-01-15T10:30:00Z") (Instant/parse "2024-06-15T12:00:00Z") nil]
-              test-ds (-> (ds/->dataset {:val instants}) (vary-meta assoc :name "ts_tz_w"))]
+              test-ds  (-> (ds/->dataset {:val instants}) (vary-meta assoc :name "ts_tz_w"))]
           (duck/insert-dataset! cn test-ds)
           (let [r (duck/sql->dataset cn "SELECT * FROM ts_tz_w" {:key-fn keyword})]
             (is (= (Instant/parse "2024-01-15T10:30:00Z") (first (r :val))))
@@ -328,7 +328,7 @@
   (with-open [arena (Arena/ofConfined)]
     (let [n-rows          3
           alloc           (fn [^long width]
-                            (let [s (.allocate arena (long (* width n-rows)) (long width))]
+                            (let [s (.allocate arena (long (* width n-rows)) width)]
                               ;; Poison row 1 with all 0xFF bytes — non-zero
                               ;; data so a NULL slot is observably garbage.
                               (dotimes [b (* width n-rows)]
@@ -373,8 +373,8 @@
                                 ffi/duckdb-type-map)]
           (check! (str ":DUCKDB_TYPE_DECIMAL/" internal-kw)
                   (coldata->buffer missing n-rows
-                                   {:type-kw :DUCKDB_TYPE_DECIMAL
-                                    :scale 2
+                                   {:type-kw       :DUCKDB_TYPE_DECIMAL
+                                    :scale         2
                                     :internal-type internal-id}
                                    (.address (alloc width)) nil)))))))
 
@@ -421,9 +421,9 @@
       (testing "write"
         (duck/run-query! cn "CREATE TABLE blobs_w (data BLOB)")
         (let [short-blob (.getBytes "hello" "UTF-8")
-              long-blob (.getBytes "this is a longer blob exceeding twelve bytes" "UTF-8")
-              test-ds (-> (ds/->dataset {:data [short-blob nil long-blob]})
-                          (vary-meta assoc :name "blobs_w"))]
+              long-blob  (.getBytes "this is a longer blob exceeding twelve bytes" "UTF-8")
+              test-ds    (-> (ds/->dataset {:data [short-blob nil long-blob]})
+                             (vary-meta assoc :name "blobs_w"))]
           (duck/insert-dataset! cn test-ds)
           (let [r (duck/sql->dataset cn "SELECT * FROM blobs_w" {:key-fn keyword})]
             (is (= "hello" (String. ^bytes (first (r :data)) "UTF-8")))
@@ -485,7 +485,7 @@
       (duck/run-query! cn "CREATE TYPE size AS ENUM ('small', 'medium', 'large')")
       (duck/run-query! cn "CREATE TABLE items (name VARCHAR, sz size)")
       (let [test-ds (-> (ds/->dataset {:name ["shirt" "pants" "hat" "jacket" nil]
-                                       :sz ["small" "large" "medium" "small" "large"]})
+                                       :sz   ["small" "large" "medium" "small" "large"]})
                         (vary-meta assoc :name "items"))]
         (duck/insert-dataset! cn test-ds)
         (let [r (duck/sql->dataset cn "SELECT * FROM items" {:key-fn keyword})]
@@ -499,7 +499,7 @@
       (testing "read - integers"
         (duck/run-query! cn "CREATE TABLE int_lists_r (vals INTEGER[])")
         (duck/run-query! cn "INSERT INTO int_lists_r VALUES ([1, 2, 3]), ([4, 5]), (NULL), ([]), ([NULL, 7])")
-        (let [r (duck/sql->dataset cn "SELECT * FROM int_lists_r" {:key-fn keyword})
+        (let [r    (duck/sql->dataset cn "SELECT * FROM int_lists_r" {:key-fn keyword})
               vals (vec (r :vals))]
           (is (= [1 2 3] (first vals)))
           (is (= [4 5] (second vals)))
@@ -519,7 +519,7 @@
         (let [test-ds (-> (ds/->dataset {:vals [[1 2 3] [4 5] nil [] [nil 7]]})
                           (vary-meta assoc :name "int_lists_w"))]
           (duck/insert-dataset! cn test-ds)
-          (let [r (duck/sql->dataset cn "SELECT * FROM int_lists_w" {:key-fn keyword})
+          (let [r    (duck/sql->dataset cn "SELECT * FROM int_lists_w" {:key-fn keyword})
                 vals (vec (r :vals))]
             (is (= [1 2 3] (first vals)))
             (is (= [4 5] (second vals)))
@@ -542,7 +542,7 @@
   (with-fresh-conn
     (fn [cn]
       (duck/run-query! cn "CREATE TABLE struct_w (id INTEGER, point STRUCT(x DOUBLE, y DOUBLE))")
-      (let [test-ds (-> (ds/->dataset {:id [1 2 3]
+      (let [test-ds (-> (ds/->dataset {:id    [1 2 3]
                                        :point [{:x 1.0 :y 2.0}
                                                {:x 3.0 :y 4.0}
                                                {:x 5.0 :y 6.0}]})
@@ -590,19 +590,19 @@
 (deftest fast-path-numeric-with-nulls-test
   (with-fresh-conn
     (fn [cn]
-      (let [n fast-path-rows
+      (let [n         fast-path-rows
             ;; Sprinkle nulls at non-uniform chunk offsets to exercise the
             ;; per-chunk missing-bitmap offset merge across chunk boundaries.
             null-rows #{0 1 100 2047 2048 2049 4097 (- n 1)}
-            longs (mapv (fn [i] (when-not (null-rows i) (long i)))   (range n))
-            doubles (mapv (fn [i] (when-not (null-rows i) (* i 1.5))) (range n))
-            ints (mapv (fn [i] (when-not (null-rows i) (int i)))     (range n))
-            floats (mapv (fn [i] (when-not (null-rows i) (float i))) (range n))
-            ds-in (-> (ds/->dataset {:longs longs :doubles doubles :ints ints :floats floats})
-                      (vary-meta assoc :name "fp_numeric_null"))]
+            longs     (mapv (fn [i] (when-not (null-rows i) (long i)))   (range n))
+            doubles   (mapv (fn [i] (when-not (null-rows i) (* i 1.5))) (range n))
+            ints      (mapv (fn [i] (when-not (null-rows i) (int i)))     (range n))
+            floats    (mapv (fn [i] (when-not (null-rows i) (float i))) (range n))
+            ds-in     (-> (ds/->dataset {:longs longs :doubles doubles :ints ints :floats floats})
+                          (vary-meta assoc :name "fp_numeric_null"))]
         (duck/create-table! cn ds-in)
         (duck/insert-dataset! cn ds-in)
-        (let [out (duck/sql->dataset cn "SELECT * FROM fp_numeric_null ORDER BY longs NULLS LAST")
+        (let [out  (duck/sql->dataset cn "SELECT * FROM fp_numeric_null ORDER BY longs NULLS LAST")
               card (fn [^org.roaringbitmap.RoaringBitmap bm] (.getCardinality bm))]
           (is (= n (ds/row-count out)))
           ;; Missing rows should match the null count (positions differ post-ORDER BY,
@@ -619,7 +619,7 @@
 (deftest fast-path-mixed-partition-stitch-test
   (with-fresh-conn
     (fn [cn]
-      (let [n fast-path-rows
+      (let [n     fast-path-rows
             ;; Column order: numeric, string, numeric, string, numeric.
             ;; The stitch step must re-interleave numeric (fast-path) and
             ;; string (fallback) columns back into this original positional order.
@@ -645,19 +645,19 @@
 (deftest fast-path-wide-numeric-test
   (with-fresh-conn
     (fn [cn]
-      (let [n fast-path-rows
+      (let [n         fast-path-rows
             base-date (java.time.LocalDate/of 2020 1 1)
             ;; 8-column wide table: exercises the parallel pmap across many
             ;; columns simultaneously plus a packed temporal type.
-            ds-in (-> (ds/->dataset {:l1 (long-array (range n))
-                                     :l2 (long-array (map #(* 2 %) (range n)))
-                                     :d1 (double-array (map #(* 0.5 %) (range n)))
-                                     :d2 (double-array (map #(* 1.5 %) (range n)))
-                                     :i1 (int-array (range n))
-                                     :i2 (int-array (map #(* 3 %) (range n)))
-                                     :f1 (float-array (map float (range n)))
-                                     :dt (mapv #(.plusDays base-date (long %)) (range n))})
-                      (vary-meta assoc :name "fp_wide_num"))]
+            ds-in     (-> (ds/->dataset {:l1 (long-array (range n))
+                                         :l2 (long-array (map #(* 2 %) (range n)))
+                                         :d1 (double-array (map #(* 0.5 %) (range n)))
+                                         :d2 (double-array (map #(* 1.5 %) (range n)))
+                                         :i1 (int-array (range n))
+                                         :i2 (int-array (map #(* 3 %) (range n)))
+                                         :f1 (float-array (map float (range n)))
+                                         :dt (mapv #(.plusDays base-date (long %)) (range n))})
+                          (vary-meta assoc :name "fp_wide_num"))]
         (duck/create-table! cn ds-in)
         (duck/insert-dataset! cn ds-in)
         (let [out (duck/sql->dataset cn "SELECT * FROM fp_wide_num ORDER BY l1")]
@@ -703,16 +703,16 @@
 (deftest fast-path-packed-temporal-test
   (with-fresh-conn
     (fn [cn]
-      (let [n fast-path-rows
+      (let [n         fast-path-rows
             base-date (java.time.LocalDate/of 2020 1 1)
             base-time (java.time.LocalTime/of 10 30 0)
             base-inst (java.time.Instant/parse "2020-01-01T10:00:00Z")
-            ds-in (-> (ds/->dataset
-                       {:id (long-array (range n))
-                        :d  (mapv #(.plusDays base-date (long %)) (range n))
-                        :t  (mapv #(.plusNanos base-time (long (* % 1000))) (range n))
-                        :i  (mapv #(.plusSeconds base-inst (long %)) (range n))})
-                      (vary-meta assoc :name "fp_temporal"))]
+            ds-in     (-> (ds/->dataset
+                           {:id (long-array (range n))
+                            :d  (mapv #(.plusDays base-date (long %)) (range n))
+                            :t  (mapv #(.plusNanos base-time (long (* % 1000))) (range n))
+                            :i  (mapv #(.plusSeconds base-inst (long %)) (range n))})
+                          (vary-meta assoc :name "fp_temporal"))]
         (duck/create-table! cn ds-in)
         (duck/insert-dataset! cn ds-in)
         (let [out (duck/sql->dataset cn "SELECT * FROM fp_temporal ORDER BY id")]
@@ -731,7 +731,7 @@
   (with-fresh-conn
     (fn [cn]
       (testing "single numeric column — falls back, still correct"
-        (let [n fast-path-rows
+        (let [n     fast-path-rows
               ds-in (-> (ds/->dataset {:val (long-array (range n))})
                         (vary-meta assoc :name "fp_single_col"))]
           (duck/create-table! cn ds-in)
@@ -740,7 +740,7 @@
             (is (= n (ds/row-count out)))
             (is (= (vec (range n)) (vec (get out "val")))))))
       (testing "small query (< 8 chunks) — falls back, still correct"
-        (let [n 100  ;; way below fast-path threshold
+        (let [n     100  ;; way below fast-path threshold
               ds-in (-> (ds/->dataset {:a (long-array (range n))
                                        :b (double-array (range n))})
                         (vary-meta assoc :name "fp_small"))]
@@ -760,8 +760,8 @@
   Pass the same table-name across batches to feed one appender."
   [table-name start n]
   (assert (>= n 1) "make-stream-ds requires at least 1 row for stable dtypes")
-  (-> (ds/->dataset {:id (long-array (range start (+ start n)))
-                     :name (mapv #(str "row-" %) (range start (+ start n)))
+  (-> (ds/->dataset {:id    (long-array (range start (+ start n)))
+                     :name  (mapv #(str "row-" %) (range start (+ start n)))
                      :score (double-array (map #(* 0.5 %) (range start (+ start n))))})
       (vary-meta assoc :name table-name)))
 
@@ -814,9 +814,9 @@
   (testing "buffered rows invisible until flush"
     (with-fresh-conn
       (fn [cn]
-        (let [sample (stream-schema-sample "stream_flush")
+        (let [sample     (stream-schema-sample "stream_flush")
               count-rows #(first ((duck/sql->dataset cn "SELECT count(*) AS n FROM stream_flush"
-                                                    {:key-fn keyword}) :n))]
+                                                     {:key-fn keyword}) :n))]
           (duck/create-table! cn sample)
           (duck/run-query! cn "DELETE FROM stream_flush")
           (with-open [app (duck/open-appender cn sample)]
@@ -845,7 +845,7 @@
             (dotimes [i 5]
               (duck/append-dataset! app-a (make-stream-ds "stream_multi_a" (* i 3) 3))
               (duck/append-dataset! app-b (-> (ds/->dataset
-                                               {:label (mapv #(str "l-" %) (range (* i 2) (+ (* i 2) 2)))
+                                               {:label  (mapv #(str "l-" %) (range (* i 2) (+ (* i 2) 2)))
                                                 :weight (float-array (map #(* 0.25 %)
                                                                           (range (* i 2) (+ (* i 2) 2))))})
                                               (vary-meta assoc :name "stream_multi_b")))))
@@ -866,8 +866,8 @@
         (duck/run-query! cn "DELETE FROM stream_sm")
         (with-open [app (duck/open-appender cn sample)]
           (testing "extra column rejected"
-            (let [bad (-> (ds/->dataset {:id (long-array [0])
-                                         :name ["x"]
+            (let [bad (-> (ds/->dataset {:id    (long-array [0])
+                                         :name  ["x"]
                                          :score (double-array [0.0])
                                          :extra (long-array [1])})
                           (vary-meta assoc :name "stream_sm"))]
@@ -875,15 +875,15 @@
                                     #"Batch schema does not match"
                                     (duck/append-dataset! app bad)))))
           (testing "missing column rejected"
-            (let [bad (-> (ds/->dataset {:id (long-array [0])
+            (let [bad (-> (ds/->dataset {:id   (long-array [0])
                                          :name ["x"]})
                           (vary-meta assoc :name "stream_sm"))]
               (is (thrown-with-msg? IllegalArgumentException
                                     #"Batch schema does not match"
                                     (duck/append-dataset! app bad)))))
           (testing "wrong dtype rejected"
-            (let [bad (-> (ds/->dataset {:id (long-array [0])
-                                         :name ["x"]
+            (let [bad (-> (ds/->dataset {:id    (long-array [0])
+                                         :name  ["x"]
                                          :score (long-array [0])}) ;; int instead of double
                           (vary-meta assoc :name "stream_sm"))]
               (is (thrown-with-msg? IllegalArgumentException
@@ -896,9 +896,9 @@
   (with-fresh-conn
     (fn [cn]
       (let [sample (stream-schema-sample "stream_closed")
-            _ (duck/create-table! cn sample)
-            _ (duck/run-query! cn "DELETE FROM stream_closed")
-            app (duck/open-appender cn sample)]
+            _      (duck/create-table! cn sample)
+            _      (duck/run-query! cn "DELETE FROM stream_closed")
+            app    (duck/open-appender cn sample)]
         (duck/append-dataset! app (make-stream-ds "stream_closed" 0 2))
         (.close ^java.lang.AutoCloseable app)
         (is (thrown-with-msg? IllegalStateException
@@ -923,9 +923,9 @@
       (duck/run-query! cn "CREATE TABLE stream_pk (id INTEGER PRIMARY KEY, v VARCHAR)")
       (let [batch-1 (-> (ds/->dataset {:id (int-array [1 2]) :v ["a" "b"]})
                         (vary-meta assoc :name "stream_pk"))
-            dup (-> (ds/->dataset {:id (int-array [1]) :v ["x"]})
-                    (vary-meta assoc :name "stream_pk"))
-            app (duck/open-appender cn batch-1)]
+            dup     (-> (ds/->dataset {:id (int-array [1]) :v ["x"]})
+                        (vary-meta assoc :name "stream_pk"))
+            app     (duck/open-appender cn batch-1)]
         (try
           ;; First batch commits cleanly.
           (duck/append-dataset! app batch-1)
