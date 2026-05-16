@@ -74,9 +74,16 @@
    (with-open [arena (Arena/ofConfined)]
      (let [path (or path "")
            config-ptr (when-not (empty? config-options)
-                        (let [cp (.allocate arena ffi/VL-ADDR)]
-                          (ffi/duckdb_create_config cp)
+                        (let [cp (.allocate arena ffi/VL-ADDR)
+                              ccrc (ffi/duckdb_create_config cp)]
+                          ;; Guard against a NULL config: skipping the rc
+                          ;; check would let `duckdb_set_config` dereference
+                          ;; a NULL pointer and segfault the JVM.
+                          (when-not (== (int ccrc) ffi/DuckDBSuccess)
+                            (throw (Exception. "duckdb_create_config failed")))
                           (let [cfg (.get cp ffi/VL-ADDR 0)]
+                            (when (or (nil? cfg) (== 0 (.address cfg)))
+                              (throw (Exception. "duckdb_create_config returned NULL")))
                             (doseq [[k v] config-options]
                               (ffi/duckdb_set_config cfg
                                                      (ffi/alloc-c-str arena (str k))
@@ -739,49 +746,70 @@
           (try (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
                (catch Throwable _))
           (throw (Exception. (str "Appender create error: " err)))))
-      (try
-        (let [n-cols       (ds/column-count schema-dataset)
-              colvec       (vec (ds/columns schema-dataset))
-              dtypes       (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
-              duckdb-ids   (mapv dtype->duckdb-type dtypes)
-              ;; Only probe appender column types when dataset has columns
-              ;; that may need special handling. Pure numeric/temporal/uuid
-              ;; datasets skip all probe FFI calls.
-              needs-probe? (some (fn [ci]
-                                   (let [dt (dtypes ci)]
-                                     (or (nil? (duckdb-ids ci))
-                                         (= dt :string))))
-                                 (range n-cols))
-              col-overrides (if needs-probe?
-                              (probe-col-overrides appender n-cols)
-                              {})
-              types-seg (.allocate setup-arena (* n-cols 8))
-              _ (dotimes [ci n-cols]
-                  (if-let [ovr (get col-overrides ci)]
-                    ;; Use appender's logical type (e.g. ENUM, DECIMAL)
-                    (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
-                    ;; Normal: create from dataset dtype
-                    (.set types-seg ffi/VL-ADDR (long (* ci 8))
-                          ^MemorySegment (ffi/duckdb_create_logical_type (int (duckdb-ids ci))))))
-              ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
-              ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
-              vecs (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %))
-                                      (range n-cols)))
-              ;; Extract logical-type addresses so we don't need types-seg later.
-              ;; (The arena holding types-seg closes when this fn returns.)
-              logical-types (mapv (fn [ci] (.get types-seg ffi/VL-ADDR (long (* ci 8))))
-                                  (range n-cols))]
-          {:appender      appender
-           :write-chunk   write-chunk
-           :vecs          vecs
-           :dtypes        dtypes
-           :col-overrides col-overrides
-           :logical-types logical-types
-           :table-name    table-name})
-        (catch Throwable t
-          (try (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
-               (catch Throwable _))
-          (throw t))))))
+      ;; All logical types that need to be freed on failure (whether
+      ;; obtained from `probe-col-overrides` or freshly created via
+      ;; `duckdb_create_logical_type`) accumulate into this list as soon
+      ;; as we own them. On success they end up under `:logical-types`
+      ;; on the returned state map; on failure the catch drains them.
+      (let [^java.util.ArrayList cleanup-lts (java.util.ArrayList.)]
+        (try
+          (let [n-cols       (ds/column-count schema-dataset)
+                colvec       (vec (ds/columns schema-dataset))
+                dtypes       (mapv (comp packing/unpack-datatype dt/elemwise-datatype) colvec)
+                duckdb-ids   (mapv dtype->duckdb-type dtypes)
+                ;; Only probe appender column types when dataset has columns
+                ;; that may need special handling. Pure numeric/temporal/uuid
+                ;; datasets skip all probe FFI calls.
+                needs-probe? (some (fn [ci]
+                                     (let [dt (dtypes ci)]
+                                       (or (nil? (duckdb-ids ci))
+                                           (= dt :string))))
+                                   (range n-cols))
+                col-overrides (if needs-probe?
+                                (probe-col-overrides appender n-cols)
+                                {})
+                ;; Register every override's logical type for cleanup the
+                ;; moment we take ownership of it.
+                _ (doseq [ovr (vals col-overrides)]
+                    (.add cleanup-lts ^MemorySegment (:lt ovr)))
+                types-seg (.allocate setup-arena (* n-cols 8))
+                _ (dotimes [ci n-cols]
+                    (if-let [ovr (get col-overrides ci)]
+                      ;; Use appender's logical type (e.g. ENUM, DECIMAL)
+                      (.set types-seg ffi/VL-ADDR (long (* ci 8)) ^MemorySegment (:lt ovr))
+                      ;; Normal: create from dataset dtype — track for cleanup
+                      ;; before storing into the seg, so a throw between
+                      ;; create and store can't strand it.
+                      (let [^MemorySegment lt
+                            (ffi/duckdb_create_logical_type (int (duckdb-ids ci)))]
+                        (.add cleanup-lts lt)
+                        (.set types-seg ffi/VL-ADDR (long (* ci 8)) lt))))
+                ^MemorySegment write-chunk (ffi/duckdb_create_data_chunk types-seg (long n-cols))
+                ;; Pre-fetch vector handles — stable across duckdb_data_chunk_reset
+                vecs (object-array (map #(ffi/duckdb_data_chunk_get_vector write-chunk (long %))
+                                        (range n-cols)))
+                ;; Extract logical-type addresses so we don't need types-seg later.
+                ;; (The arena holding types-seg closes when this fn returns.)
+                logical-types (mapv (fn [ci] (.get types-seg ffi/VL-ADDR (long (* ci 8))))
+                                    (range n-cols))]
+            {:appender      appender
+             :write-chunk   write-chunk
+             :vecs          vecs
+             :dtypes        dtypes
+             :col-overrides col-overrides
+             :logical-types logical-types
+             :table-name    table-name})
+          (catch Throwable t
+            ;; Free every logical type we took ownership of before re-throwing.
+            ;; Wrapped in best-effort try/catch so a misbehaving destroy can't
+            ;; mask the original failure.
+            (dotimes [i (.size cleanup-lts)]
+              (try (ffi/destroy-ptr! ffi/duckdb_destroy_logical_type
+                                     ^MemorySegment (.get cleanup-lts i))
+                   (catch Throwable _)))
+            (try (ffi/destroy-ptr! ffi/duckdb_appender_destroy appender)
+                 (catch Throwable _))
+            (throw t)))))))
 
 (defn- destroy-appender-state!
   "Release all native resources held by an appender state map."
@@ -912,7 +940,19 @@
   AutoCloseable
   (close [_]
     (when (.compareAndSet closed? false true)
-      (destroy-appender-state! state)))
+      ;; `duckdb_appender_destroy` flushes implicitly but throws away the
+      ;; return code — silently dropping rows on a constraint violation.
+      ;; Flush explicitly first so we can surface the error, then tear
+      ;; the appender down regardless. Mirrors the poisoning logic in
+      ;; `flush-appender!`.
+      (let [^MemorySegment app (:appender state)
+            rc (ffi/duckdb_appender_flush app)]
+        (if (== (int rc) ffi/DuckDBSuccess)
+          (destroy-appender-state! state)
+          (let [err (ffi/read-c-str
+                     ^MemorySegment (ffi/duckdb_appender_error app))]
+            (try (destroy-appender-state! state) (catch Throwable _))
+            (throw (Exception. (str "Appender close-flush failed: " err))))))))
   Object
   (toString [_]
     (str "#duckdb-appender[\"" (:table-name state) "\""
@@ -1497,9 +1537,25 @@
   (when-let [item (.get s)]
     (cons item (lazy-seq (supplier-seq s)))))
 
-(deftype ^:private ResultChunks [sql result-seg destroy-result* realize-chunk reduce-type]
+(deftype ^:private ResultChunks [sql result-seg destroy-result* realize-chunk reduce-type
+                                 ^java.util.ArrayList retained-chunks]
   AutoCloseable
-  (close [_] @destroy-result*)
+  (close [_]
+    ;; Destroy any chunks that were retained for the result's lifetime
+    ;; (`:zero-copy-retain` mode — used by `:single` so the multi-chunk
+    ;; concat / parallel-memcpy fast-path can keep referencing native
+    ;; chunk memory through materialization). Done before
+    ;; `duckdb_destroy_result` so the chunks unwind in reverse-creation
+    ;; order, matching DuckDB's expectations.
+    (when retained-chunks
+      (let [n (.size retained-chunks)]
+        (dotimes [i n]
+          (try
+            (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk
+                              ^MemorySegment (.get retained-chunks i))
+            (catch Throwable _)))
+        (.clear retained-chunks)))
+    @destroy-result*)
   Supplier
   (get [_]
     (let [^MemorySegment chunk (ffi/duckdb_fetch_chunk result-seg)]
@@ -1514,16 +1570,42 @@
         (if (and chunk (not= 0 (.address chunk)) (not (reduced? acc)))
           (do
             (instr-inc! :chunks)
-            (let [result (case reduce-type
-                           :clone
-                           (let [ds (realize-chunk chunk true)]
-                             (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
-                             (rfn acc ds))
-                           :zero-copy
-                           (rfn acc (realize-chunk chunk false)))]
+            (let [result
+                  (case reduce-type
+                    :clone
+                    ;; Realize+clone copies all column data into JVM heap
+                    ;; before we destroy the chunk; safe to free immediately.
+                    (let [ds (realize-chunk chunk true)]
+                      (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
+                      (rfn acc ds))
+
+                    :zero-copy
+                    ;; Hand a native-backed dataset to `rfn`, then free the
+                    ;; chunk as soon as `rfn` returns. Callers MUST NOT
+                    ;; retain the dataset across iterations — clone it
+                    ;; inside the reducer if you need to keep it. The
+                    ;; try/finally guards against rfn throwing.
+                    (try
+                      (rfn acc (realize-chunk chunk false))
+                      (finally
+                        (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)))
+
+                    :zero-copy-retain
+                    ;; Native-backed dataset, chunk retained until the
+                    ;; result is closed. Internal: lets `:single` mode run
+                    ;; `datasets->dataset`'s fast-path numeric concat (which
+                    ;; needs all chunks alive simultaneously) without the
+                    ;; old per-chunk leak. The chunk is added to the
+                    ;; retain list BEFORE `realize-chunk`/`rfn` run, so
+                    ;; even if they throw the chunk will be reclaimed at
+                    ;; close-time.
+                    (do
+                      (.add retained-chunks chunk)
+                      (rfn acc (realize-chunk chunk false))))]
               (recur result)))
           (do
-            ;; Destroy last null chunk if needed
+            ;; Sentinel chunk on stream end is still a valid handle DuckDB
+            ;; expects us to free.
             (when (and chunk (not= 0 (.address chunk)))
               (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk))
             (if (reduced? acc) @acc acc))))))
@@ -1649,8 +1731,12 @@
                                      (persistent! colmap)
                                      {:name :_unnamed}
                                      0 0))))
-        reduce-type (get options :reduce-type :clone)]
-    (ResultChunks. sql result-seg destroy-result* realize-chunk reduce-type)))
+        reduce-type (get options :reduce-type :clone)
+        ;; Allocate the retain list only when needed — keeps the common
+        ;; `:clone` / `:zero-copy` paths allocation-free.
+        retained-chunks (when (= reduce-type :zero-copy-retain)
+                          (java.util.ArrayList.))]
+    (ResultChunks. sql result-seg destroy-result* realize-chunk reduce-type retained-chunks)))
 
 ;; ---------------------------------------------------------------------------
 ;; 11. datasets->dataset
@@ -1888,7 +1974,12 @@
                      destroy-result* (delay (ffi/duckdb_destroy_result result-seg)
                                             (.close pend-arena))
                      opts (if (= result-type :single)
-                            (assoc options :reduce-type :zero-copy)
+                            ;; `:single` materializes inside
+                            ;; `datasets->dataset` (parallel-memcpy fast
+                            ;; path needs every chunk alive at once); use
+                            ;; the retain mode so chunks live until the
+                            ;; ResultChunks closes, instead of leaking.
+                            (assoc options :reduce-type :zero-copy-retain)
                             options)
                      res-data (results->datasets sql result-seg destroy-result* opts)]
                  (case result-type
