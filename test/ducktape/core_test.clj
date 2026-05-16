@@ -10,7 +10,9 @@
             [tech.v3.resource :as resource])
   (:import [java.util UUID]
            [java.time Instant]
-           [java.math BigDecimal BigInteger]))
+           [java.math BigDecimal BigInteger]
+           [java.lang.foreign Arena]
+           [org.roaringbitmap RoaringBitmap]))
 
 (duck/initialize!)
 
@@ -263,6 +265,118 @@
           (let [r (duck/sql->dataset cn "SELECT * FROM ts_ns_w" {:key-fn keyword})]
             ;; Microsecond precision preserved (ns write multiplies by 1000)
             (is (= (Instant/parse "2024-01-15T10:30:00.123456Z") (first (r :val))))))))))
+
+(deftest timestamp-null-slot-poisoned-test
+  ;; Regression: the TIMESTAMP_S / _MS / _NS readers must honor the missing
+  ;; bitmap. DuckDB does not zero NULL cell memory; if a NULL slot's
+  ;; underlying long happens to be outside Instant's valid range,
+  ;; Instant/ofEpochSecond throws DateTimeException when dt/clone walks the
+  ;; column inside sql->dataset's realize-chunk path. Previously this
+  ;; surfaced as a non-deterministic flake in `timestamp-precision-test`.
+  ;;
+  ;; The fix is now uniformly applied via the private `nil-on-missing`
+  ;; reader wrapper, so this test also acts as a guard against the wrapper
+  ;; being accidentally bypassed for any reader that calls into JVM
+  ;; constructors which may throw on garbage longs (TIMESTAMP_S today; any
+  ;; future readers with similar range constraints).
+  ;;
+  ;; The poison value (Long/MAX_VALUE) is:
+  ;;   * Out of range for Instant/ofEpochSecond  → would throw for _S
+  ;;   * In range for Instant/ofEpochMilli       → would silently produce
+  ;;                                                garbage for _MS
+  ;;   * In range after divide-by-1e9 for _NS    → would silently produce
+  ;;                                                garbage for _NS
+  ;; so the test catches both the hard crash (S) and the silent-wrong
+  ;; (MS/NS) variants of the same omission.
+  (with-open [arena (Arena/ofConfined)]
+    (let [n-rows          3
+          seg             (.allocate arena (long (* 8 n-rows)) 8)
+          _               (doto seg
+                            (.set ffi/VL-LONG (long 0)  0)
+                            (.set ffi/VL-LONG (long 8)  Long/MAX_VALUE)
+                            (.set ffi/VL-LONG (long 16) 0))
+          data-ptr        (.address seg)
+          missing         (doto (RoaringBitmap.) (.add (int 1)))
+          coldata->buffer @#'ducktape.core/coldata->buffer]
+      (doseq [type-kw [:DUCKDB_TYPE_TIMESTAMP_S
+                       :DUCKDB_TYPE_TIMESTAMP_MS
+                       :DUCKDB_TYPE_TIMESTAMP_NS]]
+        (testing (str type-kw " honors missing bitmap on poisoned NULL slot")
+          (let [reader (coldata->buffer missing n-rows {:type-kw type-kw} data-ptr nil)]
+            (is (some? (.readObject reader 0)) "non-null row 0 reads")
+            (is (nil?  (.readObject reader 1)) "NULL row returns nil (not garbage / not throws)")
+            (is (some? (.readObject reader 2)) "non-null row 2 reads")
+            ;; Materialize via dt/clone — this is the path sql->dataset uses
+            ;; (realize-chunk -> Column. missing @delayed-data ...).
+            (let [cloned (vec (dt/clone reader))]
+              (is (= 3 (count cloned)))
+              (is (nil? (cloned 1)) "cloned column has nil at NULL slot"))))))))
+
+(deftest complex-readers-null-slot-poisoned-test
+  ;; Sibling regression to `timestamp-null-slot-poisoned-test`. After the
+  ;; nil-on-missing wrapper refactor, every complex reader (UUID, HUGEINT,
+  ;; INTERVAL, DECIMAL × 4 internal types, BLOB, ENUM × 3) returns nil at
+  ;; missing indices instead of silently allocating garbage objects from
+  ;; uninitialised NULL-slot memory. This test pokes each one to lock in
+  ;; that behaviour.
+  ;;
+  ;; UUID / HUGEINT / INTERVAL / DECIMAL never threw on garbage bytes —
+  ;; their failure mode was silent wrong values that happened to be
+  ;; masked downstream by the Column's missing bitmap. The point of this
+  ;; test is to detect drift: if anyone removes a wrapper, the assertions
+  ;; on the NULL row flip from nil to non-nil.
+  (with-open [arena (Arena/ofConfined)]
+    (let [n-rows          3
+          alloc           (fn [^long width]
+                            (let [s (.allocate arena (long (* width n-rows)) (long width))]
+                              ;; Poison row 1 with all 0xFF bytes — non-zero
+                              ;; data so a NULL slot is observably garbage.
+                              (dotimes [b (* width n-rows)]
+                                (when (and (>= b width) (< b (* 2 width)))
+                                  (.set s ffi/VL-BYTE (long b) (unchecked-byte 0xff))))
+                              s))
+          missing         (doto (RoaringBitmap.) (.add (int 1)))
+          coldata->buffer @#'ducktape.core/coldata->buffer
+          check!          (fn [label reader]
+                            (testing label
+                              (is (nil? (.readObject reader 1))
+                                  "NULL row returns nil")
+                              (let [cloned (vec (dt/clone reader))]
+                                (is (= 3 (count cloned)))
+                                (is (nil? (cloned 1))
+                                    "cloned column has nil at NULL slot"))))]
+
+      ;; UUID — 16-byte slots
+      (check! ":DUCKDB_TYPE_UUID"
+              (coldata->buffer missing n-rows
+                               {:type-kw :DUCKDB_TYPE_UUID}
+                               (.address (alloc 16)) nil))
+
+      ;; HUGEINT — 16-byte slots
+      (check! ":DUCKDB_TYPE_HUGEINT"
+              (coldata->buffer missing n-rows
+                               {:type-kw :DUCKDB_TYPE_HUGEINT}
+                               (.address (alloc 16)) nil))
+
+      ;; INTERVAL — 16-byte slots (months/days/micros)
+      (check! ":DUCKDB_TYPE_INTERVAL"
+              (coldata->buffer missing n-rows
+                               {:type-kw :DUCKDB_TYPE_INTERVAL}
+                               (.address (alloc 16)) nil))
+
+      ;; DECIMAL — exercise all four internal storage types
+      (doseq [[internal-kw width] [[:DUCKDB_TYPE_SMALLINT 2]
+                                   [:DUCKDB_TYPE_INTEGER  4]
+                                   [:DUCKDB_TYPE_BIGINT   8]
+                                   [:DUCKDB_TYPE_HUGEINT  16]]]
+        (let [internal-id (some (fn [[id kw]] (when (= kw internal-kw) id))
+                                ffi/duckdb-type-map)]
+          (check! (str ":DUCKDB_TYPE_DECIMAL/" internal-kw)
+                  (coldata->buffer missing n-rows
+                                   {:type-kw :DUCKDB_TYPE_DECIMAL
+                                    :scale 2
+                                    :internal-type internal-id}
+                                   (.address (alloc width)) nil)))))))
 
 (deftest hugeint-test
   (with-fresh-conn

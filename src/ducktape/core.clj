@@ -1107,6 +1107,46 @@
    :DUCKDB_TYPE_TIMESTAMP [8  :packed-instant]
    :DUCKDB_TYPE_TIMESTAMP_TZ [8  :packed-instant]})
 
+(defn- nil-on-missing
+  "Wrap an ObjectReader so it returns nil at NULL indices.
+
+  When `missing` is empty, returns `inner` unchanged — zero overhead on
+  dense (null-free) columns, which is the common case.
+
+  When `missing` is non-empty, the wrapper guards every `readObject`
+  with a `RoaringBitmap.contains` check. The inner reader is only ever
+  asked to decode non-NULL indices, so its body can safely assume the
+  underlying memory is valid (no need to repeat the missing-check
+  inside each reify body). This is the safety net that catches
+  unzeroed NULL-slot memory uniformly across every complex reader
+  (TIMESTAMP_S/MS/NS, UUID, HUGEINT, INTERVAL, DECIMAL, BLOB, ENUM,
+  LIST, MAP, STRUCT). See `timestamp-null-slot-poisoned-test` for the
+  regression that motivated this."
+  ^ObjectReader [^RoaringBitmap missing ^ObjectReader inner]
+  (if (.isEmpty missing)
+    ;; Dense column: identity — no overhead, inner's own PClone (if any)
+    ;; is preserved (e.g. UUID's tight Unsafe loop).
+    inner
+    (let [n (.lsize inner)
+          dt (.elemwiseDatatype inner)]
+      (reify ObjectReader
+        (elemwiseDatatype [_] dt)
+        (lsize [_] n)
+        (readObject [_ idx]
+          (when-not (.contains missing (int idx))
+            (.readObject inner idx)))
+        dt-proto/PClone
+        (clone [_]
+          ;; Materialize: write only non-missing slots; output array is
+          ;; zero-initialised so NULL slots stay nil with no extra work.
+          ;; Inner is only ever asked to decode non-NULL indices, so its
+          ;; reader body is free to assume the bytes are valid.
+          (let [^objects out (make-array Object n)]
+            (dotimes [i n]
+              (when-not (.contains missing (int i))
+                (aset out i (.readObject inner i))))
+            (hamf/wrap-array out)))))))
+
 (defn- coldata->buffer
   [^RoaringBitmap missing n-rows type-info data-ptr ^MemorySegment vector-seg]
   (let [n-rows (long n-rows)
@@ -1123,23 +1163,28 @@
         :DUCKDB_TYPE_UUID
         (let [base-addr data-ptr
               ^sun.misc.Unsafe u ffi/UNSAFE]
-          (reify
-            ObjectReader
-            (elemwiseDatatype [_] :uuid)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [addr (+ base-addr (* idx 16))]
-                (UUID. (.getLong u (+ addr 8))
-                       (.getLong u addr))))
-            dt-proto/PClone
-            (clone [_]
-              ;; Unsafe raw reads; cross-column parallelism via futures in realize-chunk
-              (let [^objects out (make-array UUID n-rows)]
-                (dotimes [i n-rows]
-                  (let [addr (+ base-addr (* i 16))]
-                    (aset out (int i) (UUID. (.getLong u (+ addr 8))
-                                             (.getLong u addr)))))
-                (hamf/wrap-array out)))))
+          ;; nil-on-missing returns this inner reader unchanged when there
+          ;; are no nulls, so the optimized PClone (tight Unsafe loop) is
+          ;; preserved on the dense path. On the sparse-null path the
+          ;; wrapper's own PClone walks indices and skips missing slots.
+          (nil-on-missing missing
+            (reify
+              ObjectReader
+              (elemwiseDatatype [_] :uuid)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (let [addr (+ base-addr (* idx 16))]
+                  (UUID. (.getLong u (+ addr 8))
+                         (.getLong u addr))))
+              dt-proto/PClone
+              (clone [_]
+                ;; Reached only when missing is empty (wrapper-bypass path).
+                (let [^objects out (make-array UUID n-rows)]
+                  (dotimes [i n-rows]
+                    (let [addr (+ base-addr (* i 16))]
+                      (aset out (int i) (UUID. (.getLong u (+ addr 8))
+                                               (.getLong u addr)))))
+                  (hamf/wrap-array out))))))
 
         :DUCKDB_TYPE_VARCHAR
         ;; Single reinterpreted segment for the whole string_t array — avoid per-element ofAddress
@@ -1210,56 +1255,59 @@
                 (hamf/wrap-array out)))))
 
         :DUCKDB_TYPE_TIMESTAMP_S
+        ;; NULL-row safety handled by nil-on-missing wrapper.
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :instant)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [secs (.get seg ffi/VL-LONG (long (* idx 8)))]
-                (Instant/ofEpochSecond secs)))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :instant)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (Instant/ofEpochSecond (.get seg ffi/VL-LONG (long (* idx 8))))))))
 
         :DUCKDB_TYPE_TIMESTAMP_MS
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :instant)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [ms (.get seg ffi/VL-LONG (long (* idx 8)))]
-                (Instant/ofEpochMilli ms)))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :instant)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (Instant/ofEpochMilli (.get seg ffi/VL-LONG (long (* idx 8))))))))
 
         :DUCKDB_TYPE_TIMESTAMP_NS
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :instant)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [ns-val (.get seg ffi/VL-LONG (long (* idx 8)))
-                    secs (quot ns-val 1000000000)
-                    nanos (rem ns-val 1000000000)]
-                (Instant/ofEpochSecond secs nanos)))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :instant)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (let [ns-val (.get seg ffi/VL-LONG (long (* idx 8)))
+                      secs (quot ns-val 1000000000)
+                      nanos (rem ns-val 1000000000)]
+                  (Instant/ofEpochSecond secs nanos))))))
 
         :DUCKDB_TYPE_HUGEINT
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [off (long (* idx 16))
-                    lower (.get seg ffi/VL-LONG off)
-                    upper (.get seg ffi/VL-LONG (+ off 8))
-                    lower-bi (if (neg? lower)
-                               (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
-                               (BigInteger/valueOf lower))]
-                (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi)))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (let [off (long (* idx 16))
+                      lower (.get seg ffi/VL-LONG off)
+                      upper (.get seg ffi/VL-LONG (+ off 8))
+                      lower-bi (if (neg? lower)
+                                 (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
+                                 (BigInteger/valueOf lower))]
+                  (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi))))))
 
         :DUCKDB_TYPE_BLOB
         (let [base-addr data-ptr
               ^MemorySegment full-seg (.reinterpret (MemorySegment/ofAddress base-addr) (* 16 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (when-not (.contains missing (int idx))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
                 (let [off (long (* idx 16))
                       slen (int (.get full-seg ffi/VL-INT off))]
                   (if (<= slen 12)
@@ -1274,91 +1322,88 @@
 
         :DUCKDB_TYPE_INTERVAL
         (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (let [off (long (* idx 16))
-                    months (int (.get seg ffi/VL-INT off))
-                    days (int (.get seg ffi/VL-INT (+ off 4)))
-                    micros (.get seg ffi/VL-LONG (+ off 8))]
-                {:months months :days days :micros micros}))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (let [off (long (* idx 16))
+                      months (int (.get seg ffi/VL-INT off))
+                      days (int (.get seg ffi/VL-INT (+ off 4)))
+                      micros (.get seg ffi/VL-LONG (+ off 8))]
+                  {:months months :days days :micros micros})))))
 
         :DUCKDB_TYPE_DECIMAL
         (let [scale (long (:scale type-info))
               internal-type (long (:internal-type type-info))
               internal-kw (get ffi/duckdb-type-map internal-type)]
-          (case internal-kw
-            :DUCKDB_TYPE_SMALLINT
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :object)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (BigDecimal/valueOf (long (.get seg ffi/VL-SHORT (long (* idx 2)))) (int scale)))))
-            :DUCKDB_TYPE_INTEGER
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :object)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (BigDecimal/valueOf (long (.get seg ffi/VL-INT (long (* idx 4)))) (int scale)))))
-            :DUCKDB_TYPE_BIGINT
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :object)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (BigDecimal/valueOf (.get seg ffi/VL-LONG (long (* idx 8))) (int scale)))))
-            :DUCKDB_TYPE_HUGEINT
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :object)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (let [off (long (* idx 16))
-                        lower (.get seg ffi/VL-LONG off)
-                        upper (.get seg ffi/VL-LONG (+ off 8))
-                        lower-bi (if (neg? lower)
-                                   (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
-                                   (BigInteger/valueOf lower))]
-                    (BigDecimal. ^BigInteger (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi)
-                                 (int scale))))))
-            (throw (RuntimeException. (str "Unsupported DECIMAL internal type: " internal-kw)))))
+          (nil-on-missing missing
+            (case internal-kw
+              :DUCKDB_TYPE_SMALLINT
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :object)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (BigDecimal/valueOf (long (.get seg ffi/VL-SHORT (long (* idx 2)))) (int scale)))))
+              :DUCKDB_TYPE_INTEGER
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :object)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (BigDecimal/valueOf (long (.get seg ffi/VL-INT (long (* idx 4)))) (int scale)))))
+              :DUCKDB_TYPE_BIGINT
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 8 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :object)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (BigDecimal/valueOf (.get seg ffi/VL-LONG (long (* idx 8))) (int scale)))))
+              :DUCKDB_TYPE_HUGEINT
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :object)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (let [off (long (* idx 16))
+                          lower (.get seg ffi/VL-LONG off)
+                          upper (.get seg ffi/VL-LONG (+ off 8))
+                          lower-bi (if (neg? lower)
+                                     (.add (BigInteger/valueOf lower) (.shiftLeft BigInteger/ONE 64))
+                                     (BigInteger/valueOf lower))]
+                      (BigDecimal. ^BigInteger (.add (.shiftLeft (BigInteger/valueOf upper) 64) lower-bi)
+                                   (int scale))))))
+              (throw (RuntimeException. (str "Unsupported DECIMAL internal type: " internal-kw))))))
 
         :DUCKDB_TYPE_ENUM
         (let [dict (:enum-dict type-info)
               internal-type (long (:internal-type type-info))
               internal-kw (get ffi/duckdb-type-map internal-type)]
-          (case internal-kw
-            :DUCKDB_TYPE_UTINYINT
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) n-rows)]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :string)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (when-not (.contains missing (int idx))
-                    (let [i (Byte/toUnsignedInt (.get seg ffi/VL-BYTE (long idx)))]
-                      (nth dict i))))))
-            :DUCKDB_TYPE_USMALLINT
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :string)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (when-not (.contains missing (int idx))
-                    (let [i (Short/toUnsignedInt (.get seg ffi/VL-SHORT (long (* idx 2))))]
-                      (nth dict i))))))
-            :DUCKDB_TYPE_UINTEGER
-            (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
-              (reify ObjectReader
-                (elemwiseDatatype [_] :string)
-                (lsize [_] n-rows)
-                (readObject [_ idx]
-                  (when-not (.contains missing (int idx))
-                    (let [i (Integer/toUnsignedLong (.get seg ffi/VL-INT (long (* idx 4))))]
-                      (nth dict i))))))
-            (throw (RuntimeException. (str "Unsupported ENUM internal type: " internal-kw)))))
+          (nil-on-missing missing
+            (case internal-kw
+              :DUCKDB_TYPE_UTINYINT
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) n-rows)]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :string)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (nth dict (Byte/toUnsignedInt (.get seg ffi/VL-BYTE (long idx)))))))
+              :DUCKDB_TYPE_USMALLINT
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 2 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :string)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (nth dict (Short/toUnsignedInt (.get seg ffi/VL-SHORT (long (* idx 2))))))))
+              :DUCKDB_TYPE_UINTEGER
+              (let [^MemorySegment seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 4 n-rows))]
+                (reify ObjectReader
+                  (elemwiseDatatype [_] :string)
+                  (lsize [_] n-rows)
+                  (readObject [_ idx]
+                    (nth dict (Integer/toUnsignedLong (.get seg ffi/VL-INT (long (* idx 4))))))))
+              (throw (RuntimeException. (str "Unsupported ENUM internal type: " internal-kw))))))
 
         :DUCKDB_TYPE_LIST
         (let [^MemorySegment child-vec (ffi/duckdb_list_vector_get_child vector-seg)
@@ -1369,12 +1414,11 @@
               child-buf (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
               ;; list_entry_t: offset (uint64) + length (uint64) = 16 bytes per entry
               ^MemorySegment entry-seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              ;; NULL list entries have garbage offset/length — skip them
-              (when-not (.contains missing (int idx))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
                 (let [off (long (* idx 16))
                       list-offset (.get entry-seg ffi/VL-LONG off)
                       list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
@@ -1394,11 +1438,11 @@
               child-missing (validity->missing child-size child-validity)
               child-buf (coldata->buffer child-missing child-size (:child-type type-info) (.address child-data) child-vec)
               ^MemorySegment entry-seg (.reinterpret (MemorySegment/ofAddress data-ptr) (* 16 n-rows))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (when-not (.contains missing (int idx))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
                 (let [off (long (* idx 16))
                       list-offset (.get entry-seg ffi/VL-LONG off)
                       list-length (.get entry-seg ffi/VL-LONG (+ off 8))]
@@ -1411,6 +1455,12 @@
                            (range list-length))))))))
 
         :DUCKDB_TYPE_STRUCT
+        ;; STRUCT has no outer-row missing bitmap of its own at this layer
+        ;; (DuckDB stores struct-row NULLs through the parent vector — for a
+        ;; top-level struct column that's `missing`). Child-level missing is
+        ;; handled inside the reify per-field. We still wrap with
+        ;; nil-on-missing so a NULL struct row returns nil rather than a map
+        ;; full of garbage child reads.
         (let [child-count (long (:child-count type-info))
               child-names (:child-names type-info)
               child-types (:child-types type-info)
@@ -1423,18 +1473,19 @@
                                   :missing cmissing
                                   :name (keyword (child-names ci))}))
                              (range child-count))]
-          (reify ObjectReader
-            (elemwiseDatatype [_] :object)
-            (lsize [_] n-rows)
-            (readObject [_ idx]
-              (persistent!
-               (reduce (fn [m {:keys [buf missing name]}]
-                         (assoc! m name
-                                 (if (.contains ^RoaringBitmap missing (int idx))
-                                   nil
-                                   (buf idx))))
-                       (transient {})
-                       children)))))
+          (nil-on-missing missing
+            (reify ObjectReader
+              (elemwiseDatatype [_] :object)
+              (lsize [_] n-rows)
+              (readObject [_ idx]
+                (persistent!
+                 (reduce (fn [m {:keys [buf missing name]}]
+                           (assoc! m name
+                                   (if (.contains ^RoaringBitmap missing (int idx))
+                                     nil
+                                     (buf idx))))
+                         (transient {})
+                         children))))))
 
         (throw (RuntimeException. (format "Unsupported column type: %s" type-kw)))))))
 
