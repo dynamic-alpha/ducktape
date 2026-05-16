@@ -8,13 +8,24 @@ A near drop-in replacement for [tmducken](https://github.com/techascent/tmducken
 
 ## Differences from tmducken
 
-**Project Panama instead of JNA.** Ducktape calls DuckDB's C API through `java.lang.foreign.*` (JDK 22+) rather than JNA/dtype-next FFI. This means fewer dependencies, deterministic native memory management via `Arena` scoping, and no marshalling overhead on FFI calls. The entire FFI layer is a single 250-line file of data-driven macro-generated bindings.
+**Better stability.** Built on JDK 22+ Project Panama (`java.lang.foreign.*`) instead of JNA:
 
-**More DuckDB types.** Read and write support for BLOB, HUGEINT, DECIMAL, INTERVAL, ENUM, LIST, STRUCT, MAP, and all timestamp precision variants — types tmducken does not handle.
+- Native memory lives in scoped `Arena`s — released deterministically, not when the GC runs.
+- GC-race use-after-free segfaults are ruled out by construction.
 
-**Streaming appender API.** `open-appender` / `append-dataset!` / `flush-appender!` expose DuckDB's appender as a long-lived, reusable writer. Schema setup — appender create, column-type probe, data chunk + logical type allocation — is paid once and amortized across every batch fed through it. Up to **10× faster** than repeated `insert-dataset!` calls for streaming ingest workloads with small batches (see [Streaming inserts](#streaming-inserts-appender-vs-many-one-shot-inserts)). tmducken has no equivalent.
+**More DuckDB types.** Read and write support for BLOB, HUGEINT, DECIMAL,
+INTERVAL, ENUM, LIST, STRUCT, MAP, and all timestamp precision variants — types
+tmducken does not handle.
 
-**Performance tuned.** Signature-polymorphic FFI dispatch via `MethodHandles/explicitCastArguments` + `MethodHandleProxies`, parallel string/UUID encode and decode via `hamf/pgroups`, lock-free slab allocation for pointer-style strings, RoaringBitmap validity scanning, pre-packed temporal columns, partitioned parallel-concat fast-path for multi-chunk numeric/temporal reads (one heap array per column, `MemorySegment.copy`'d in parallel across cores), and two-phase column cloning. Beats tmducken on all measured workloads — up to **4× faster** on numeric queries — see [Benchmarks](#benchmarks).
+**Streaming appender API.** `open-appender` / `append-dataset!` /
+`flush-appender!` keep DuckDB's appender alive across batches, amortizing setup
+cost — up to **10× faster** than repeated `insert-dataset!` for small-batch
+ingest (see [Streaming
+inserts](#streaming-inserts-appender-vs-many-one-shot-inserts)).
+
+**Performance tuned.** Parallel column encode/decode, direct `MethodHandle` FFI
+dispatch, partitioned parallel-concat for multi-chunk reads — up to **4×
+faster** than tmducken (see [Benchmarks](#benchmarks)).
 
 ## Requirements
 
