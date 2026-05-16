@@ -23,6 +23,9 @@
             pkgs.duckdb
             pkgs.clj-kondo
             pkgs.cljfmt
+            # Renders Conventional Commits into release notes. Preview locally
+            # with: `git cliff --unreleased` or `git cliff --latest`.
+            pkgs.git-cliff
           ];
           shellHook = ''
             export DUCKDB_HOME="${pkgs.duckdb.lib}/lib"

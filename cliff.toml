@@ -1,0 +1,55 @@
+# git-cliff config — renders Conventional Commits into GitHub Release notes.
+# Docs: https://git-cliff.org/docs/configuration
+
+[changelog]
+# The header is emitted once at the top of CHANGELOG.md. Release notes
+# generated for GitHub use `--strip header`, so this preamble is excluded
+# from the per-release output.
+header = """
+# Changelog
+
+All notable changes to ducktape are documented here.
+Commit messages follow [Conventional Commits](https://conventionalcommits.org).
+
+"""
+body = """
+{% if version %}\
+## {{ version | trim_start_matches(pat="v") }} — {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## Unreleased
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}- {{ commit.message | upper_first }}\
+{% if commit.breaking %} **[breaking]**{% endif %}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+# Parse messages as Conventional Commits (type(scope): description).
+conventional_commits = true
+# Keep non-conventional commits visible — they fall under "Other".
+filter_unconventional = false
+filter_commits = false
+# Only consider tags shaped like vMAJOR.MINOR.PATCH.
+tag_pattern = "v[0-9].*"
+# Newest first within each section.
+sort_commits = "newest"
+
+# Map commit-message prefixes to changelog sections.
+# Anything unmatched falls through into "Other".
+commit_parsers = [
+  { message = "^feat",         group = "Features" },
+  { message = "^fix",          group = "Bug Fixes" },
+  { message = "^perf",         group = "Performance" },
+  { message = "^refactor",     group = "Refactoring" },
+  { message = "^docs",         group = "Documentation" },
+  { message = "^build",        group = "Build" },
+  { message = "^ci",           group = "CI" },
+  { message = "^test",         group = "Tests" },
+  { message = "^style",        group = "Style" },
+  { message = "^(chore|misc)", group = "Miscellaneous" },
+]

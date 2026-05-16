@@ -1,6 +1,8 @@
 # Ducktape
 
 [![CI](https://github.com/dynamic-alpha/ducktape/actions/workflows/ci.yaml/badge.svg)](https://github.com/dynamic-alpha/ducktape/actions/workflows/ci.yaml)
+[![Clojars Project](https://img.shields.io/clojars/v/ai.dyal/ducktape.svg)](https://clojars.org/ai.dyal/ducktape)
+[![cljdoc badge](https://cljdoc.org/badge/ai.dyal/ducktape)](https://cljdoc.org/d/ai.dyal/ducktape/CURRENT)
 
 Connect [tech.v3.dataset](https://github.com/techascent/tech.ml.dataset) to [DuckDB](https://duckdb.org).
 
@@ -214,14 +216,85 @@ nix develop
 ### deps.edn
 
 ```clojure
-{:deps {techascent/tech.ml.dataset    {:mvn/version "8.021"}
-        techascent/tech.ml.dataset.sql {:mvn/version "7.029"}
-        com.cnuernber/ham-fisted       {:mvn/version "3.029"}
-        org.roaringbitmap/RoaringBitmap {:mvn/version "1.6.14"}}
+{:deps  {ai.dyal/ducktape {:mvn/version "0.1.0-SNAPSHOT"}}
  :aliases
  {:dev {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
 ```
 
+Snapshots are published to Clojars; nothing else needs to be configured.
+
+## Releasing
+
+Ducktape publishes to Clojars as `ai.dyal/ducktape`. The build script lives
+in [`dev/build.clj`](dev/build.clj) and runs via the `:build` alias.
+
+### Setting the version
+
+The version is resolved in this order: `:version` CLI arg → `VERSION` env var →
+`0.1.0-SNAPSHOT` default. So all three of these work:
+
+```bash
+VERSION=0.2.0-SNAPSHOT clj -T:build deploy
+clj -T:build deploy :version '"0.2.0-SNAPSHOT"'
+clj -T:build deploy                              # → 0.1.0-SNAPSHOT
+```
+
+### Local tasks
+
+| Command                | What it does                                     |
+|------------------------|--------------------------------------------------|
+| `clj -T:build jar`     | Build the jar under `target/`                    |
+| `clj -T:build install` | Install to `~/.m2` for local consumption         |
+| `clj -T:build deploy`  | Publish to Clojars (needs credentials, below)    |
+| `clj -T:build clean`   | Remove `target/`                                 |
+
+### Deploy credentials
+
+`deploy` reads two env vars:
+
+- `CLOJARS_USERNAME` — your Clojars username
+- `CLOJARS_PASSWORD` — a [Clojars deploy token](https://clojars.org/tokens),
+  ideally scoped to `ai.dyal/*`. **Not** your account password.
+
+### Snapshot via GitHub Actions
+
+Run the **Release** workflow from the repo's Actions tab. The default
+version is `0.1.0-SNAPSHOT`; override it in the workflow input if needed.
+
+### Tagged release
+
+The release flow has two steps: stamp the changelog, then tag.
+
+```bash
+# 1. Prepend the new release section to CHANGELOG.md
+git cliff --tag v0.1.0 --unreleased --prepend CHANGELOG.md
+
+# 2. Commit, tag, push
+git add CHANGELOG.md
+git commit -m "docs: changelog for v0.1.0"
+git tag v0.1.0
+git push origin main v0.1.0
+```
+
+The Release workflow then:
+
+1. Runs the test suite.
+2. Publishes `ai.dyal/ducktape 0.1.0` to Clojars.
+3. Re-runs [`git-cliff`](https://git-cliff.org) for release notes (same content
+   as the new `CHANGELOG.md` section).
+4. Creates a GitHub Release at the tag with those notes as the body.
+
+Preview the notes before stamping:
+
+```bash
+git cliff --unreleased    # what would land in the next release
+git cliff --latest        # what landed in the most recent release
+```
+
+Sections in `CHANGELOG.md` are grouped by Conventional Commit type (`feat:` →
+Features, `fix:` → Bug Fixes, `perf:` → Performance, etc.) per the rules in
+[`cliff.toml`](cliff.toml).
+
 ## License
 
-EPL-2.0
+MIT — Copyright © 2026 Dynamic Alpha Technologies Inc. See [`LICENSE`](LICENSE).

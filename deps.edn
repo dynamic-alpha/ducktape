@@ -24,4 +24,10 @@
                    "-XX:+UnlockDiagnosticVMOptions"
                    "-XX:+DebugNonSafepoints"
                    ;; Silences "dynamic loading of agents was deprecated" warning on JDK 21+
-                   "-XX:+EnableDynamicAgentLoading"]}}}
+                   "-XX:+EnableDynamicAgentLoading"]}
+  ;; Build, install, deploy. See dev/build.clj.
+  ;; Invoke with: clj -T:build <task>
+  :build {:deps       {io.github.clojure/tools.build {:git/tag "v0.10.7" :git/sha "573711e"}
+                       slipset/deps-deploy           {:mvn/version "0.2.3"}}
+          :paths      ["dev"]
+          :ns-default build}}}
