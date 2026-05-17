@@ -1829,9 +1829,15 @@
 (def ^:private fast-concat-numeric-dtypes
   "Dtypes for which the partitioned fast-path can concatenate via bulk memcpy
   + dt/elemwise-cast tagging.  All other dtypes (strings, uuids, decimals,
-  lists, etc.) fall through to the standard apply ds/concat path."
+  lists, etc.) fall through to the standard apply ds/concat path.
+
+  NOTE: `:boolean` is intentionally excluded — `coldata->buffer` wraps boolean
+  columns with `dt/elemwise-cast`, which produces a Buffer that is not
+  convertible back to a NativeBuffer (`as-native-buffer` returns nil), so
+  the fast-path's `set-native-datatype` re-tag would NPE.  Booleans flow
+  through the standard `apply ds/concat` path instead."
   #{:int8 :uint8 :int16 :uint16 :int32 :uint32 :int64 :uint64
-    :float32 :float64 :boolean
+    :float32 :float64
     :packed-local-date :packed-local-time :packed-instant})
 
 (def ^:private dtype->storage-dtype
@@ -1931,16 +1937,30 @@
                       (let [other-names (mapv col-names other-idxs)
                             projected   (mapv #(ds/select-columns % other-names) dsdata)]
                         (vec (ds/columns (apply ds/concat projected))))))
-                  ;; Parallel-memcpy each numeric column across cores
+                  ;; Parallel-memcpy each numeric column across cores.
+                  ;;
+                  ;; CRITICAL: if pmap throws we MUST join other-cols-fut
+                  ;; before propagating.  Otherwise the orphan future keeps
+                  ;; reading native chunk memory after the caller's
+                  ;; `with-open` closes the ResultChunks and `destroy-data-chunk`
+                  ;; frees every retained chunk — classic use-after-free →
+                  ;; SIGSEGV in jshort_disjoint_arraycopy on a ForkJoinPool
+                  ;; commonPool worker.  Joining (deref + swallow) is safe:
+                  ;; the future's own exceptions don't mask the original.
                   numeric-cols
-                  (vec (hamf/pmap
-                        (fn [^long ni]
-                          (let [cidx (long (numeric-idxs ni))]
-                            (concat-numeric-col dsdata cidx
-                                                (col-names cidx) (col-metas cidx)
-                                                (col-dtypes cidx) total-rows
-                                                row-counts offsets)))
-                        (range n-numeric)))
+                  (try
+                    (vec (hamf/pmap
+                          (fn [^long ni]
+                            (let [cidx (long (numeric-idxs ni))]
+                              (concat-numeric-col dsdata cidx
+                                                  (col-names cidx) (col-metas cidx)
+                                                  (col-dtypes cidx) total-rows
+                                                  row-counts offsets)))
+                          (range n-numeric)))
+                    (catch Throwable t
+                      (when other-cols-fut
+                        (try @other-cols-fut (catch Throwable _)))
+                      (throw t)))
                   other-cols  (when other-cols-fut @other-cols-fut)
                   ;; Stitch numeric + other back into original column order
                   numeric-pos (zipmap numeric-idxs (range))

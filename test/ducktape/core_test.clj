@@ -724,6 +724,58 @@
           (is (= (.plusDays base-date (dec n)) (last (get out "d"))))
           (is (= (.plusSeconds base-inst (dec n)) (last (get out "i")))))))))
 
+(deftest fast-path-with-boolean-column-test
+  ;; Regression test for use-after-free + NPE triggered by BOOLEAN columns
+  ;; in the partitioned parallel-concat fast-path.
+  ;;
+  ;; tech.ml.dataset surfaces DuckDB BOOLEAN columns as a `dt/elemwise-cast`
+  ;; wrapper over the underlying :int8 NativeBuffer.  The wrapper is NOT a
+  ;; NativeBuffer and is not convertible to one, so the fast-path's
+  ;; `set-native-datatype` re-tag used to NPE on `nb` being nil — and the
+  ;; sibling non-numeric `future` would then keep reading freed native
+  ;; chunk memory after the caller's `with-open` closed the result,
+  ;; segfaulting the JVM in `jshort_disjoint_arraycopy`.
+  ;;
+  ;; Boolean columns must now flow through the standard `apply ds/concat`
+  ;; path (they're excluded from `fast-concat-numeric-dtypes`), and the
+  ;; fast-path numeric pmap must join the sibling future before
+  ;; propagating any exception.
+  (with-fresh-conn
+    (fn [cn]
+      (let [n         fast-path-rows
+            null-rows #{1 2049 (- n 1)}
+            ds-in     (-> (ds/->dataset
+                           {:id   (long-array (range n))
+                            ;; >=2 numeric/temporal columns + >=8 chunks
+                            ;; together trigger the fast-path.
+                            :v    (double-array (map #(* 0.25 %) (range n)))
+                            ;; Boolean column with some nulls scattered
+                            ;; across chunk boundaries.
+                            :flag (mapv (fn [i]
+                                          (when-not (null-rows i)
+                                            (even? i)))
+                                        (range n))})
+                          (vary-meta assoc :name "fp_with_bool"))]
+        (duck/create-table! cn ds-in)
+        (duck/insert-dataset! cn ds-in)
+        (let [out (duck/sql->dataset cn "SELECT * FROM fp_with_bool ORDER BY id")]
+          (is (= n (ds/row-count out)))
+          (is (= 3 (ds/column-count out)))
+          (is (= :boolean (dt/elemwise-datatype (get out "flag"))))
+          (is (= 0 (long (first (get out "id")))))
+          (is (= (long (dec n)) (long (last (get out "id")))))
+          ;; Spot-check non-null boolean values
+          (is (true?  (nth (get out "flag") 0)))
+          (is (false? (nth (get out "flag") 3)))
+          (is (true?  (nth (get out "flag") 4)))
+          ;; And confirm the nulls round-tripped at the right indices.
+          (let [missing (ds/missing (get out "flag"))]
+            (is (= (count null-rows)
+                   (.getCardinality ^RoaringBitmap missing)))
+            (doseq [i null-rows]
+              (is (.contains ^RoaringBitmap missing (int i))
+                  (str "null at row " i)))))))))
+
 (deftest fast-path-fallback-thresholds-test
   ;; The fast path is gated on (>= n-numeric 2) AND (>= n-chunks 8).  Below
   ;; either threshold the function falls back to apply ds/concat.  Both
