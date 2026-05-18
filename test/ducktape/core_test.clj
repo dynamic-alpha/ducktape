@@ -1042,3 +1042,147 @@
         (let [r (duck/sql->dataset cn "SELECT count(*) AS n FROM stream_special"
                                    {:key-fn keyword})]
           (is (= 15 (first (r :n)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Wrapper types — Db / Conn / open? / use-after-close
+;; ---------------------------------------------------------------------------
+
+(deftest with-open-flow-test
+  (testing "with-open closes Db and Conn in inner-first order"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (with-open [_ db
+                  _ conn]
+        (is (duck/open? db))
+        (is (duck/open? conn))
+        (duck/run-query! conn "SELECT 1"))
+      (is (not (duck/open? conn)))
+      (is (not (duck/open? db))))))
+
+(deftest idempotent-close-test
+  (testing "double-close on Conn and Db is a no-op (CAS-guarded)"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (.close conn) (.close conn) (.close conn)
+      (.close db)   (.close db)
+      (is (not (duck/open? conn)))
+      (is (not (duck/open? db)))))
+  (testing "duck/disconnect and duck/close-db delegate to .close and are also idempotent"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (duck/disconnect conn)
+      (duck/disconnect conn)
+      (duck/close-db db)
+      (duck/close-db db)
+      (is (not (duck/open? conn)))
+      (is (not (duck/open? db))))))
+
+(deftest use-after-close-throws-test
+  (testing "ops on a closed Conn throw IllegalStateException, not segfault"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (.close conn)
+      (is (thrown-with-msg? IllegalStateException #"Connection is closed"
+                            (duck/run-query! conn "SELECT 1")))
+      (is (thrown-with-msg? IllegalStateException #"Connection is closed"
+                            (duck/sql->dataset conn "SELECT 1")))
+      (.close db)))
+  (testing "ops on a closed Db throw IllegalStateException"
+    (let [db (duck/open-db)]
+      (.close db)
+      (is (thrown-with-msg? IllegalStateException #"Database handle is closed"
+                            (duck/connect db))))))
+
+(deftest type-coercion-rejection-test
+  (testing "passing a raw long is rejected with a clear error"
+    (is (thrown-with-msg? IllegalArgumentException #"Expected Conn"
+                          (duck/run-query! 0 "SELECT 1")))
+    (is (thrown-with-msg? IllegalArgumentException #"Expected Db"
+                          (duck/connect 0))))
+  (testing "passing nil is rejected with a clear error"
+    (is (thrown-with-msg? IllegalArgumentException #"Expected Conn"
+                          (duck/run-query! nil "SELECT 1")))
+    (is (thrown-with-msg? IllegalArgumentException #"Expected Db"
+                          (duck/close-db nil)))))
+
+(deftest locking-on-conn-works-test
+  ;; Regression: returning a primitive long made `(locking conn ...)`
+  ;; impossible — primitives don't have monitors. Conn is now a regular
+  ;; Object, so monitors work.
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (locking conn
+      (duck/run-query! conn "SELECT 1")
+      (is true))))
+
+(deftest open?-predicate-test
+  (let [db   (duck/open-db)
+        conn (duck/connect db)]
+    (is (true? (duck/open? db)))
+    (is (true? (duck/open? conn)))
+    (.close conn)
+    (is (true? (duck/open? db)))
+    (is (false? (duck/open? conn)))
+    (.close db)
+    (is (false? (duck/open? db))))
+  (testing "open? rejects non-handle inputs"
+    (is (thrown? IllegalArgumentException (duck/open? 42)))
+    (is (thrown? IllegalArgumentException (duck/open? nil))))
+  (testing "open? also covers Appender"
+    (with-fresh-conn
+      (fn [cn]
+        (duck/run-query! cn "CREATE TABLE oa_app (n INTEGER)")
+        (let [sample (-> (ds/->dataset {:n [1]}) (vary-meta assoc :name "oa_app"))
+              app    (duck/open-appender cn sample)]
+          (is (true? (duck/open? app)))
+          (.close app)
+          (is (false? (duck/open? app))))))))
+
+;; ---------------------------------------------------------------------------
+;; Transactions — transact! / with-tx
+;; ---------------------------------------------------------------------------
+
+(deftest transact!-commit-test
+  (with-fresh-conn
+    (fn [cn]
+      (duck/run-query! cn "CREATE TABLE tx_commit (n INTEGER)")
+      (let [r (duck/transact! cn
+                              (fn [c]
+                                (duck/run-query! c "INSERT INTO tx_commit VALUES (1), (2), (3)")
+                                :returned-value))]
+        (is (= :returned-value r))
+        (is (= 3 (first ((duck/sql->dataset cn "SELECT count(*) c FROM tx_commit") "c"))))))))
+
+(deftest transact!-rollback-on-throw-test
+  (with-fresh-conn
+    (fn [cn]
+      (duck/run-query! cn "CREATE TABLE tx_rb (n INTEGER)")
+      (duck/run-query! cn "INSERT INTO tx_rb VALUES (1)")
+      (let [original-ex (ex-info "boom" {:id 42})
+            thrown      (try
+                          (duck/transact! cn
+                                          (fn [c]
+                                            (duck/run-query! c "INSERT INTO tx_rb VALUES (99)")
+                                            (throw original-ex)))
+                          nil
+                          (catch Throwable t t))]
+        (testing "original exception propagates unchanged"
+          (is (identical? original-ex thrown)))
+        (testing "rollback wiped the in-transaction INSERT"
+          (is (= 1 (first ((duck/sql->dataset cn "SELECT count(*) c FROM tx_rb") "c")))))))))
+
+(deftest with-tx-macro-test
+  (with-fresh-conn
+    (fn [cn]
+      (duck/run-query! cn "CREATE TABLE tx_macro (n INTEGER)")
+      (testing "commit"
+        (duck/with-tx [cn]
+          (duck/run-query! cn "INSERT INTO tx_macro VALUES (1), (2)"))
+        (is (= 2 (first ((duck/sql->dataset cn "SELECT count(*) c FROM tx_macro") "c")))))
+      (testing "rollback on body throw"
+        (try
+          (duck/with-tx [cn]
+            (duck/run-query! cn "INSERT INTO tx_macro VALUES (99)")
+            (throw (RuntimeException. "rollback please")))
+          (catch RuntimeException _ nil))
+        (is (= 2 (first ((duck/sql->dataset cn "SELECT count(*) c FROM tx_macro") "c"))))))))

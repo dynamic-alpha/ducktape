@@ -55,30 +55,46 @@ FFI refuses native downcalls without it.
 
 (duck/initialize!)
 
-(def db (duck/open-db))           ;; in-memory, or (open-db "/tmp/my.db")
-(def conn (duck/connect db))
+(with-open [db   (duck/open-db)        ;; in-memory, or (open-db "/tmp/my.db")
+            conn (duck/connect db)]
 
-;; Create + insert
-(def my-ds (ds/->dataset {:name  ["Alice" "Bob" "Carol"]
-                          :age   [30 25 35]
-                          :score [9.5 8.2 9.8]}
-                         {:dataset-name "people"})
+  (let [my-ds (ds/->dataset {:name  ["Alice" "Bob" "Carol"]
+                            :age   [30 25 35]
+                            :score [9.5 8.2 9.8]}
+                           {:dataset-name "people"})]
+    (duck/create-table! conn my-ds)
+    (duck/insert-dataset! conn my-ds))
 
-(duck/create-table! conn my-ds)
-(duck/insert-dataset! conn my-ds)
-
-;; Query back
-(duck/sql->dataset conn "SELECT * FROM people WHERE score > 9.0" {:key-fn keyword})
+  (duck/sql->dataset conn "SELECT * FROM people WHERE score > 9.0"
+                     {:key-fn keyword}))
 ;; => :_unnamed [2 3]:
 ;; |  :name | :age | :score |
 ;; |--------|-----:|-------:|
 ;; |  Alice |   30 |    9.5 |
 ;; |  Carol |   35 |    9.8 |
-
-;; Cleanup
-(duck/disconnect conn)
-(duck/close-db db)
 ```
+
+`open-db` returns a `Db`, `connect` returns a `Conn`. Both implement
+`java.lang.AutoCloseable`. Close is idempotent; ops on a closed handle
+throw `IllegalStateException`. `(duck/disconnect conn)` and
+`(duck/close-db db)` are equivalent to `(.close conn)` / `(.close db)`.
+
+## Transactions
+
+```clojure
+;; with-tx — BEGIN, body, COMMIT on success; ROLLBACK + rethrow on throw
+(duck/with-tx [conn]
+  (duck/run-query! conn "INSERT INTO ledger VALUES (1, 100)")
+  (duck/run-query! conn "INSERT INTO ledger VALUES (2, -100)"))
+
+;; transact! — same semantics, fn-based
+(duck/transact! conn
+  (fn [c]
+    (duck/run-query! c "INSERT INTO ledger VALUES (3, 50)")
+    :ok))
+```
+
+DuckDB does not support nested transactions.
 
 ## Streaming inserts
 
@@ -108,8 +124,10 @@ See [Benchmarks](#benchmarks) for a quantitative comparison vs repeated
 | Function | Description |
 |----------|-------------|
 | `initialize!` | Load the DuckDB shared library. Call once at startup. |
-| `open-db` / `close-db` | Open/close a database (path or in-memory) |
-| `connect` / `disconnect` | Create/destroy a connection |
+| `open-db` / `close-db` | Open/close a database (path or in-memory). Returns an `AutoCloseable` `Db`. |
+| `connect` / `disconnect` | Create/destroy a connection. Returns an `AutoCloseable` `Conn`. |
+| `open?` | Predicate — `true` while a `Db`/`Conn` handle's native resource is live. |
+| `transact!` / `with-tx` | Run body inside `BEGIN`/`COMMIT`; auto-`ROLLBACK` + rethrow on any throw. |
 | `run-query!` | Execute SQL, ignore results (DDL, DML) |
 | `create-table!` / `drop-table!` | Create/drop a table from a dataset schema |
 | `insert-dataset!` | Bulk insert via DuckDB's data chunk appender API |

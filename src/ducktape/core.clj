@@ -65,12 +65,89 @@
   ([] (initialize! nil)))
 
 ;; ---------------------------------------------------------------------------
-;; 2. open-db
+;; 2. AutoCloseable wrapper types — Db / Conn / Appender
+;; ---------------------------------------------------------------------------
+
+(defprotocol IHandle
+  "Common protocol for ducktape resource handles (`Db`, `Conn`, `Appender`)
+  whose underlying native resource has a closed/open lifecycle."
+  (-handle-open? [handle]))
+
+(deftype Db [^long ptr ^AtomicBoolean open?]
+  IHandle
+  (-handle-open? [_] (.get open?))
+  AutoCloseable
+  (close [_]
+    (when (.compareAndSet open? true false)
+      (with-open [arena (Arena/ofConfined)]
+        (let [p (.allocate arena ffi/VL-ADDR)]
+          (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+          (ffi/duckdb_close p)))))
+  Object
+  (toString [_]
+    (str "#ducktape/Db[0x" (Long/toHexString ptr)
+         (when-not (.get open?) " :closed") "]")))
+
+(deftype Conn [^long ptr ^Db db ^AtomicBoolean open?]
+  IHandle
+  (-handle-open? [_] (.get open?))
+  AutoCloseable
+  (close [_]
+    (when (.compareAndSet open? true false)
+      ;; Skip disconnect if parent db is closed — `duckdb_close` already
+      ;; freed the native conn, so calling `duckdb_disconnect` would
+      ;; dereference freed memory.
+      (when (.get ^AtomicBoolean (.-open? db))
+        (with-open [arena (Arena/ofConfined)]
+          (let [p (.allocate arena ffi/VL-ADDR)]
+            (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+            (ffi/duckdb_disconnect p))))))
+  Object
+  (toString [_]
+    (str "#ducktape/Conn[0x" (Long/toHexString ptr)
+         (when-not (.get open?) " :closed") "]")))
+
+(defn open?
+  "Return true if the handle's native resource is still open."
+  [handle]
+  (when (nil? handle)
+    (throw (IllegalArgumentException. "Expected a handle, got nil")))
+  (when-not (satisfies? IHandle handle)
+    (throw (IllegalArgumentException.
+            (str "Expected a ducktape handle, got: " (.getName (class handle))))))
+  (-handle-open? handle))
+
+(defn- -db-ptr
+  ^long [^Db db]
+  (when-not (instance? Db db)
+    (throw (IllegalArgumentException.
+            (str "Expected Db, got: "
+                 (if (nil? db) "nil" (.getName (class db)))))))
+  (when-not (.get ^AtomicBoolean (.-open? db))
+    (throw (IllegalStateException. "Database handle is closed")))
+  (.-ptr db))
+
+(defn- -conn-ptr
+  ^long [^Conn conn]
+  (when-not (instance? Conn conn)
+    (throw (IllegalArgumentException.
+            (str "Expected Conn, got: "
+                 (if (nil? conn) "nil" (.getName (class conn)))))))
+  (when-not (.get ^AtomicBoolean (.-open? conn))
+    (throw (IllegalStateException. "Connection is closed")))
+  (.-ptr conn))
+
+;; ---------------------------------------------------------------------------
+;; 3. open-db / close-db
 ;; ---------------------------------------------------------------------------
 
 (defn open-db
-  "Open a database. path may be nil for in-memory."
-  (^long [^String path config-options]
+  "Open a DuckDB database and return an `AutoCloseable` `Db` handle.
+
+  `path` may be nil or empty for an in-memory database. `config-options`
+  is an optional map of DuckDB config strings (e.g. `{:threads \"4\"}`)
+  passed to `duckdb_set_config`."
+  (^Db [^String path config-options]
    (with-open [arena (Arena/ofConfined)]
      (let [path       (or path "")
            config-ptr (when-not (empty? config-options)
@@ -89,11 +166,11 @@
                                                      (ffi/alloc-c-str arena (str k))
                                                      (ffi/alloc-c-str arena (str v))))
                             cfg)))
-           db-ptr     (.allocate arena ffi/VL-ADDR)
+           db-out     (.allocate arena ffi/VL-ADDR)
            err-ptr    (.allocate arena ffi/VL-ADDR)
            rc         (ffi/duckdb_open_ext
                        (ffi/alloc-c-str arena path)
-                       db-ptr
+                       db-out
                        (if config-ptr config-ptr MemorySegment/NULL)
                        err-ptr)]
        ;; Destroy config if we created one
@@ -104,35 +181,42 @@
                err-str (ffi/read-c-str err-seg)]
            (when err-seg (ffi/duckdb_free err-seg))
            (throw (Exception. (format "Error opening database: %s" err-str)))))
-       (.address (.get db-ptr ffi/VL-ADDR 0)))))
-  (^long [^String path] (open-db path nil))
-  (^long [] (open-db "")))
+       (->Db (.address (.get db-out ffi/VL-ADDR 0)) (AtomicBoolean. true)))))
+  (^Db [^String path] (open-db path nil))
+  (^Db [] (open-db "")))
 
-;; ---------------------------------------------------------------------------
-;; 3. close-db
-;; ---------------------------------------------------------------------------
-
-(defn close-db [^long db]
-  (with-open [arena (Arena/ofConfined)]
-    (let [p (.allocate arena ffi/VL-ADDR)]
-      (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress db))
-      (ffi/duckdb_close p))))
+(defn close-db
+  "Close a `Db`. Idempotent. Returns nil."
+  [^Db db]
+  (when-not (instance? Db db)
+    (throw (IllegalArgumentException.
+            (str "Expected Db, got: "
+                 (if (nil? db) "nil" (.getName (class db)))))))
+  (.close db))
 
 ;; ---------------------------------------------------------------------------
 ;; 4. connect / disconnect
 ;; ---------------------------------------------------------------------------
 
-(defn connect ^long [^long db]
-  (with-open [arena (Arena/ofConfined)]
-    (let [p (.allocate arena ffi/VL-ADDR)]
-      (ffi/duckdb_connect (MemorySegment/ofAddress db) p)
-      (.address (.get p ffi/VL-ADDR 0)))))
+(defn connect
+  "Open a connection to `db`. Returns an `AutoCloseable` `Conn`."
+  ^Conn [^Db db]
+  (let [dbp (-db-ptr db)]
+    (with-open [arena (Arena/ofConfined)]
+      (let [p (.allocate arena ffi/VL-ADDR)]
+        (ffi/duckdb_connect (MemorySegment/ofAddress dbp) p)
+        (->Conn (.address (.get p ffi/VL-ADDR 0))
+                db
+                (AtomicBoolean. true))))))
 
-(defn disconnect [^long conn]
-  (with-open [arena (Arena/ofConfined)]
-    (let [p (.allocate arena ffi/VL-ADDR)]
-      (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress conn))
-      (ffi/duckdb_disconnect p))))
+(defn disconnect
+  "Disconnect a `Conn`. Idempotent. Returns nil."
+  [^Conn conn]
+  (when-not (instance? Conn conn)
+    (throw (IllegalArgumentException.
+            (str "Expected Conn, got: "
+                 (if (nil? conn) "nil" (.getName (class conn)))))))
+  (.close conn))
 
 ;; ---------------------------------------------------------------------------
 ;; 5. run-query!
@@ -140,11 +224,12 @@
 
 (defn run-query!
   "Execute a SQL statement, ignoring results. Used for DDL."
-  [^long conn ^String sql]
+  [^Conn conn ^String sql]
   (with-open [arena (Arena/ofConfined)]
-    (let [result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
+    (let [cp     (-conn-ptr conn)
+          result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
           rc     (ffi/duckdb_query
-                  (MemorySegment/ofAddress conn)
+                  (MemorySegment/ofAddress cp)
                   (ffi/alloc-c-str arena sql)
                   result)]
       (when-not (== rc ffi/DuckDBSuccess)
@@ -155,17 +240,46 @@
       :ok)))
 
 ;; ---------------------------------------------------------------------------
+;; 5b. Transactions — transact! / with-tx
+;; ---------------------------------------------------------------------------
+
+(defn transact!
+  "Run `f` (a 1-arg fn taking `conn`) inside a DuckDB transaction.
+  Issues `BEGIN`, calls `(f conn)`, then `COMMIT`. On throw from `f`,
+  issues `ROLLBACK` and re-throws the original exception (rollback
+  failures are suppressed). Returns the value returned by `f`."
+  [^Conn conn f]
+  (run-query! conn "BEGIN TRANSACTION")
+  (try
+    (let [r (f conn)]
+      (run-query! conn "COMMIT")
+      r)
+    (catch Throwable t
+      (try (run-query! conn "ROLLBACK") (catch Throwable _))
+      (throw t))))
+
+(defmacro with-tx
+  "Run `body` inside a DuckDB transaction on `conn`. See `transact!`.
+
+    (with-tx [conn]
+      (run-query! conn \"INSERT ...\")
+      ...)"
+  {:style/indent 1}
+  [[conn] & body]
+  `(transact! ~conn (fn [_#] ~@body)))
+
+;; ---------------------------------------------------------------------------
 ;; 6. create-table! / drop-table!
 ;; ---------------------------------------------------------------------------
 
 (defn create-table!
-  ([conn dataset options]
+  ([^Conn conn dataset options]
    (let [sql-str (sql/create-sql "duckdb" dataset)]
      (run-query! conn sql-str)
      (sql/table-name dataset options)))
   ([conn dataset] (create-table! conn dataset nil)))
 
-(defn drop-table! [conn dataset]
+(defn drop-table! [^Conn conn dataset]
   (let [ds-name (sql/table-name dataset)]
     (run-query! conn (format "drop table %s" ds-name))
     ds-name))
@@ -781,9 +895,9 @@
   Returned state owns native resources. Caller is responsible for invoking
   `destroy-appender-state!`. On partial failure inside this fn (e.g. the
   data chunk fails to allocate) the appender is destroyed before re-throwing."
-  [^long conn ^String table-name schema-dataset]
+  [^Conn conn ^String table-name schema-dataset]
   (with-open [setup-arena (Arena/ofConfined)]
-    (let [conn-seg                (MemorySegment/ofAddress conn)
+    (let [conn-seg                (MemorySegment/ofAddress (-conn-ptr conn))
           app-ptr                 (.allocate setup-arena ffi/VL-ADDR)
           app-rc                  (ffi/duckdb_appender_create conn-seg
                                                               (ffi/alloc-c-str setup-arena "")
@@ -970,7 +1084,7 @@
   batches.
 
   Returns the number of rows written."
-  ([^long conn dataset options]
+  ([^Conn conn dataset options]
    (let [table-name (sql/table-name dataset options)
          state      (setup-appender-state! conn table-name dataset)]
      (try
@@ -985,10 +1099,12 @@
 ;; 7c. Appender — long-lived, reusable streaming writer
 ;; ---------------------------------------------------------------------------
 
-(deftype Appender [state ^AtomicBoolean closed?]
+(deftype Appender [state ^AtomicBoolean open?]
+  IHandle
+  (-handle-open? [_] (.get open?))
   AutoCloseable
   (close [_]
-    (when (.compareAndSet closed? false true)
+    (when (.compareAndSet open? true false)
       ;; `duckdb_appender_destroy` flushes implicitly but throws away the
       ;; return code — silently dropping rows on a constraint violation.
       ;; Flush explicitly first so we can surface the error, then tear
@@ -1005,10 +1121,10 @@
   Object
   (toString [_]
     (str "#duckdb-appender[\"" (:table-name state) "\""
-         (when (.get closed?) " :closed") "]")))
+         (when-not (.get open?) " :closed") "]")))
 
-(defn- check-appender-open! [^Appender app]
-  (when (.get ^AtomicBoolean (.-closed? app))
+(defn- -check-appender-open! [^Appender app]
+  (when-not (.get ^AtomicBoolean (.-open? app))
     (throw (IllegalStateException.
             "Appender is closed (or was poisoned by a failed flush)."))))
 
@@ -1038,10 +1154,10 @@
   must be used only by the thread that owns its connection."
   (^AutoCloseable [conn schema-dataset]
    (open-appender conn schema-dataset nil))
-  (^AutoCloseable [^long conn schema-dataset options]
+  (^AutoCloseable [^Conn conn schema-dataset options]
    (let [table-name (sql/table-name schema-dataset options)
          state      (setup-appender-state! conn table-name schema-dataset)]
-     (->Appender state (AtomicBoolean. false)))))
+     (->Appender state (AtomicBoolean. true)))))
 
 (defn append-dataset!
   "Append `dataset` to the open `appender`. `dataset` must have the same
@@ -1053,7 +1169,7 @@
   Throws `IllegalStateException` if the appender has been closed, or
   `IllegalArgumentException` if the dataset schema does not match."
   [^Appender appender dataset]
-  (check-appender-open! appender)
+  (-check-appender-open! appender)
   (let [state           (.-state appender)
         expected-dtypes (:dtypes state)
         batch-dtypes    (mapv (comp packing/unpack-datatype dt/elemwise-datatype)
@@ -1079,14 +1195,14 @@
 
   Returns `:ok` on success."
   [^Appender appender]
-  (check-appender-open! appender)
+  (-check-appender-open! appender)
   (let [state              (.-state appender)
         ^MemorySegment app (:appender state)
         rc                 (ffi/duckdb_appender_flush app)]
     (when-not (== (int rc) ffi/DuckDBSuccess)
       (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app))]
         ;; Poison: destroy state exactly once (CAS in close() will then no-op).
-        (when (.compareAndSet ^AtomicBoolean (.-closed? appender) false true)
+        (when (.compareAndSet ^AtomicBoolean (.-open? appender) true false)
           (try (destroy-appender-state! state) (catch Throwable _)))
         (throw (Exception. (str "Appender flush failed: " err)))))
     :ok))
@@ -2012,7 +2128,7 @@
 (declare prepare)
 
 (defn sql->datasets
-  (^AutoCloseable [^long conn ^String sql options]
+  (^AutoCloseable [^Conn conn ^String sql options]
    (with-open [^AutoCloseable stmt (prepare conn sql options)]
      (stmt)))
   (^AutoCloseable [conn sql] (sql->datasets conn sql nil)))
@@ -2023,10 +2139,10 @@
   ([conn sql] (sql->dataset conn sql nil)))
 
 (defn prepare
-  (^AutoCloseable [^long conn ^String sql] (prepare conn sql nil))
-  (^AutoCloseable [^long conn ^String sql options]
+  (^AutoCloseable [^Conn conn ^String sql] (prepare conn sql nil))
+  (^AutoCloseable [^Conn conn ^String sql options]
    (let [arena               (Arena/ofConfined)
-         conn-seg            (MemorySegment/ofAddress conn)
+         conn-seg            (MemorySegment/ofAddress (-conn-ptr conn))
          stmt-ptr            (.allocate arena ffi/VL-ADDR)
          rc                  (ffi/duckdb_prepare conn-seg (ffi/alloc-c-str arena sql) stmt-ptr)
          ^MemorySegment stmt (.get stmt-ptr ffi/VL-ADDR 0)
