@@ -1972,26 +1972,32 @@
 (defn- concat-numeric-col
   "Concat one numeric/temporal column across `dsdata` chunks via bulk memcpy.
 
-  Allocates a heap container at the logical `dtype` (via
-  `dt/make-container :jvm-heap dtype total-rows`) so the resulting Buffer
-  unpacks correctly on read (LocalDate for :packed-local-date, etc.).
+  Allocates a container at the logical `dtype` via
+  `(dt/make-container container-type dtype total-rows)` so the resulting
+  Buffer unpacks correctly on read (LocalDate for :packed-local-date,
+  etc.).  `container-type` is either `:jvm-heap` (default — primitive
+  Java array, GC-managed) or `:native-heap` (off-heap NativeBuffer,
+  freed by a Cleaner when the column becomes unreachable).  See the
+  `:container-type` option on `sql->dataset` for the trade-offs.
 
   Each chunk's source NativeBuffer is re-tagged to the underlying storage
   dtype before `dt/copy!`, which bypasses dtype-next's per-element
   pack/unpack dispatch and lets the copy run as a primitive bulk move.
+  Both jvm-heap and native-heap destinations support the bulk-memcpy
+  fast path (System.arraycopy and Unsafe.copyMemory respectively).
 
   Per-chunk missing bitmaps are unioned with their offsets into a single
   accumulator.
 
   Note: `col-idx` and `total-rows` are taken as Object then cast inside the
-  body — Clojure's primitive-arg fn limit is 4, and we already pay 8 here."
+  body — Clojure's primitive-arg fn limit is 4, and we already pay 9 here."
   [dsdata col-idx col-name col-meta dtype total-rows
-   ^longs row-counts ^longs offsets]
+   ^longs row-counts ^longs offsets container-type]
   (let [col-idx     (long col-idx)
         total-rows  (long total-rows)
         n-chunks    (count dsdata)
         storage-dt  (dtype->storage-dtype dtype)
-        target      (dt/make-container :jvm-heap dtype total-rows)
+        target      (dt/make-container container-type dtype total-rows)
         missing-acc (bitmap/->bitmap)]
     (dotimes [chunk-idx n-chunks]
       (let [ds                         (dsdata chunk-idx)
@@ -2014,79 +2020,91 @@
   Fast-path activates when there are >=2 numeric/temporal columns and >=8
   chunks (~16K rows at 2048/chunk).  Below that, the FJP startup cost
   outweighs the savings; we fall back to `apply ds/concat`.  Single-chunk
-  results take the existing dt/clone shortcut."
-  [^AutoCloseable results]
-  (instr-time :concat-ns
-    (let [dsdata   (vec results)
-          n-chunks (count dsdata)]
-      (cond
-        (empty? dsdata) nil
-        (== 1 n-chunks) (dt/clone (dsdata 0))
-        :else
-        (let [ds0          (dsdata 0)
-              cols0        (vec (ds/columns ds0))
-              n-cols       (count cols0)
-              col-dtypes   (mapv dt/elemwise-datatype cols0)
-              col-names    (mapv (comp :name meta) cols0)
-              col-metas    (mapv meta cols0)
-              numeric-idxs (filterv #(fast-concat-numeric-dtypes (col-dtypes %))
-                                    (range n-cols))
-              n-numeric    (count numeric-idxs)]
-          (if (or (< n-numeric 2) (< n-chunks 8))
-            ;; Heuristic guards — not worth the parallel-dispatch overhead
-            (apply ds/concat dsdata)
-            (let [other-idxs  (vec (remove (set numeric-idxs) (range n-cols)))
-                  n-other     (count other-idxs)
-                  row-counts  (long-array (map ds/row-count dsdata))
-                  total-rows  (long (reduce + row-counts))
-                  ;; Cumulative offsets: offsets[i] = sum of row-counts[0..i-1]
-                  offsets     (let [a (long-array (inc n-chunks))]
-                                (dotimes [i n-chunks]
-                                  (aset a (inc i) (+ (aget a i) (aget row-counts i))))
-                                a)
-                  ;; Start non-numeric concat on a worker thread.  Overlaps the
-                  ;; non-numeric work with our numeric pmap; cheap insurance even
-                  ;; when the string concat dominates the critical path.
-                  other-cols-fut
-                  (when (pos? n-other)
-                    (future
-                      (let [other-names (mapv col-names other-idxs)
-                            projected   (mapv #(ds/select-columns % other-names) dsdata)]
-                        (vec (ds/columns (apply ds/concat projected))))))
-                  ;; Parallel-memcpy each numeric column across cores.
-                  ;;
-                  ;; CRITICAL: if pmap throws we MUST join other-cols-fut
-                  ;; before propagating.  Otherwise the orphan future keeps
-                  ;; reading native chunk memory after the caller's
-                  ;; `with-open` closes the ResultChunks and `destroy-data-chunk`
-                  ;; frees every retained chunk — classic use-after-free →
-                  ;; SIGSEGV in jshort_disjoint_arraycopy on a ForkJoinPool
-                  ;; commonPool worker.  Joining (deref + swallow) is safe:
-                  ;; the future's own exceptions don't mask the original.
-                  numeric-cols
-                  (try
-                    (vec (hamf/pmap
-                          (fn [^long ni]
-                            (let [cidx (long (numeric-idxs ni))]
-                              (concat-numeric-col dsdata cidx
-                                                  (col-names cidx) (col-metas cidx)
-                                                  (col-dtypes cidx) total-rows
-                                                  row-counts offsets)))
-                          (range n-numeric)))
-                    (catch Throwable t
-                      (when other-cols-fut
-                        (try @other-cols-fut (catch Throwable _)))
-                      (throw t)))
-                  other-cols  (when other-cols-fut @other-cols-fut)
-                  ;; Stitch numeric + other back into original column order
-                  numeric-pos (zipmap numeric-idxs (range))
-                  other-pos   (zipmap other-idxs   (range))
-                  merged-cols (mapv (fn [cidx]
-                                      (if-let [ni (numeric-pos cidx)]
-                                        (numeric-cols ni)
-                                        (other-cols (other-pos cidx))))
-                                    (range n-cols))]
-              (ds/new-dataset (ds/dataset-name ds0) merged-cols))))))))
+  results take the existing dt/clone shortcut.
+
+  `options` is the same options map threaded down from `sql->dataset`.
+  Currently honoured here:
+    * `:container-type` (default `:jvm-heap`) — destination container for
+      numeric/temporal columns.  Set to `:native-heap` to allocate
+      off-heap NativeBuffers instead of primitive Java arrays, slashing
+      JVM heap allocation on numeric-heavy workloads.  Non-numeric columns
+      (strings/uuids/decimals/lists/…) always use `:jvm-heap` since their
+      payloads are Java objects whose references must live on the heap."
+  ([^AutoCloseable results] (datasets->dataset results nil))
+  ([^AutoCloseable results options]
+   (instr-time :concat-ns
+     (let [dsdata         (vec results)
+           n-chunks       (count dsdata)
+           container-type (get options :container-type :jvm-heap)]
+       (cond
+         (empty? dsdata) nil
+         (== 1 n-chunks) (dt/clone (dsdata 0))
+         :else
+         (let [ds0          (dsdata 0)
+               cols0        (vec (ds/columns ds0))
+               n-cols       (count cols0)
+               col-dtypes   (mapv dt/elemwise-datatype cols0)
+               col-names    (mapv (comp :name meta) cols0)
+               col-metas    (mapv meta cols0)
+               numeric-idxs (filterv #(fast-concat-numeric-dtypes (col-dtypes %))
+                                     (range n-cols))
+               n-numeric    (count numeric-idxs)]
+           (if (or (< n-numeric 2) (< n-chunks 8))
+             ;; Heuristic guards — not worth the parallel-dispatch overhead
+             (apply ds/concat dsdata)
+             (let [other-idxs  (vec (remove (set numeric-idxs) (range n-cols)))
+                   n-other     (count other-idxs)
+                   row-counts  (long-array (map ds/row-count dsdata))
+                   total-rows  (long (reduce + row-counts))
+                   ;; Cumulative offsets: offsets[i] = sum of row-counts[0..i-1]
+                   offsets     (let [a (long-array (inc n-chunks))]
+                                 (dotimes [i n-chunks]
+                                   (aset a (inc i) (+ (aget a i) (aget row-counts i))))
+                                 a)
+                   ;; Start non-numeric concat on a worker thread.  Overlaps the
+                   ;; non-numeric work with our numeric pmap; cheap insurance even
+                   ;; when the string concat dominates the critical path.
+                   other-cols-fut
+                   (when (pos? n-other)
+                     (future
+                       (let [other-names (mapv col-names other-idxs)
+                             projected   (mapv #(ds/select-columns % other-names) dsdata)]
+                         (vec (ds/columns (apply ds/concat projected))))))
+                   ;; Parallel-memcpy each numeric column across cores.
+                   ;;
+                   ;; CRITICAL: if pmap throws we MUST join other-cols-fut
+                   ;; before propagating.  Otherwise the orphan future keeps
+                   ;; reading native chunk memory after the caller's
+                   ;; `with-open` closes the ResultChunks and `destroy-data-chunk`
+                   ;; frees every retained chunk — classic use-after-free →
+                   ;; SIGSEGV in jshort_disjoint_arraycopy on a ForkJoinPool
+                   ;; commonPool worker.  Joining (deref + swallow) is safe:
+                   ;; the future's own exceptions don't mask the original.
+                   numeric-cols
+                   (try
+                     (vec (hamf/pmap
+                           (fn [^long ni]
+                             (let [cidx (long (numeric-idxs ni))]
+                               (concat-numeric-col dsdata cidx
+                                                   (col-names cidx) (col-metas cidx)
+                                                   (col-dtypes cidx) total-rows
+                                                   row-counts offsets
+                                                   container-type)))
+                           (range n-numeric)))
+                     (catch Throwable t
+                       (when other-cols-fut
+                         (try @other-cols-fut (catch Throwable _)))
+                       (throw t)))
+                   other-cols  (when other-cols-fut @other-cols-fut)
+                   ;; Stitch numeric + other back into original column order
+                   numeric-pos (zipmap numeric-idxs (range))
+                   other-pos   (zipmap other-idxs   (range))
+                   merged-cols (mapv (fn [cidx]
+                                       (if-let [ni (numeric-pos cidx)]
+                                         (numeric-cols ni)
+                                         (other-cols (other-pos cidx))))
+                                     (range n-cols))]
+               (ds/new-dataset (ds/dataset-name ds0) merged-cols)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 12. Prepared statements
@@ -2190,7 +2208,7 @@
                    :streaming res-data
                    :realized res-data
                    :single (with-open [^AutoCloseable res-data res-data]
-                             (datasets->dataset res-data))))
+                             (datasets->dataset res-data options))))
                (catch Exception e
                  (try (.close pend-arena) (catch IllegalStateException _))
                  (throw e)))))
