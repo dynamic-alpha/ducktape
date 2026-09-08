@@ -9,6 +9,7 @@
             [tech.v3.datatype.bitmap :as bitmap]
             [tech.v3.resource :as resource])
   (:import [java.util UUID]
+           [java.util.concurrent CountDownLatch]
            [java.time Instant]
            [java.math BigDecimal BigInteger]
            [java.lang.foreign Arena]
@@ -1137,6 +1138,88 @@
           (is (true? (duck/open? app)))
           (.close app)
           (is (false? (duck/open? app))))))))
+
+(deftest interrupt-idle-and-completed-query-test
+  (with-open [db (duck/open-db)
+              conn (duck/connect db)]
+    (testing "interrupting before a query is a safe no-op"
+      (is (nil? (duck/interrupt! conn)))
+      (is (= 1 (-> (duck/sql->dataset conn "SELECT 1 AS n")
+                   (get "n") first))))
+    (testing "interrupting after completion is repeat safe"
+      (dotimes [_ 3]
+        (is (nil? (duck/interrupt! conn))))
+      (is (= 2 (-> (duck/sql->dataset conn "SELECT 2 AS n")
+                   (get "n") first))))))
+
+(deftest interrupt-running-query-test
+  (with-open [db (duck/open-db)
+              conn (duck/connect db)]
+    (let [started (promise)
+          result  (future
+                    (deliver started true)
+                    (try
+                      (duck/run-query!
+                       conn
+                       (str "SELECT sum(a.i * b.i) "
+                            "FROM range(1000000) a(i), range(1000000) b(i)"))
+                      :completed
+                      (catch Throwable t t)))]
+      @started
+      ;; Give duckdb_query time to enter execution. The cross product is far
+      ;; too large to finish during this short interval.
+      (Thread/sleep 50)
+      (is (nil? (duck/interrupt! conn)))
+      (let [outcome (deref result 5000 ::timed-out)]
+        (is (instance? Throwable outcome))
+        (is (re-find #"(?i)interrupt" (ex-message outcome))))
+      (testing "the connection remains usable after interruption"
+        (is (= 42 (-> (duck/sql->dataset conn "SELECT 42 AS n")
+                      (get "n") first)))))))
+
+(deftest interrupt-close-race-test
+  (testing "interrupt is serialized with disconnect freeing the connection handle"
+    (dotimes [_ 50]
+      (let [db      (duck/open-db)
+            conn    (duck/connect db)
+            gate    (CountDownLatch. 1)
+            outcome (future
+                      (.await gate)
+                      (try
+                        (duck/interrupt! conn)
+                        :interrupted
+                        (catch IllegalStateException _ :closed)))]
+        (.countDown gate)
+        (duck/disconnect conn)
+        (is (#{:interrupted :closed} (deref outcome 5000 ::timed-out)))
+        (duck/close-db db))))
+  (testing "interrupt is serialized with closing the parent database"
+    (dotimes [_ 50]
+      (let [db      (duck/open-db)
+            conn    (duck/connect db)
+            gate    (CountDownLatch. 1)
+            outcome (future
+                      (.await gate)
+                      (try
+                        (duck/interrupt! conn)
+                        :interrupted
+                        (catch IllegalStateException _ :closed)))]
+        (.countDown gate)
+        (duck/close-db db)
+        (is (#{:interrupted :closed} (deref outcome 5000 ::timed-out)))
+        (duck/disconnect conn)))))
+
+(deftest interrupt-invalid-or-closed-handle-test
+  (testing "invalid handles fail before entering native code"
+    (is (thrown? IllegalArgumentException (duck/interrupt! nil)))
+    (is (thrown? IllegalArgumentException (duck/interrupt! 42))))
+  (testing "a closed connection cannot be interrupted"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (duck/disconnect conn)
+      (is (thrown-with-msg? IllegalStateException #"Connection is closed"
+                            (duck/interrupt! conn)))
+      (duck/close-db db))))
 
 ;; ---------------------------------------------------------------------------
 ;; Transactions — transact! / with-tx

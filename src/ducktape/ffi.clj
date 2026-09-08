@@ -330,6 +330,7 @@
    ["duckdb_destroy_config"     :void [:addr]                    nil]
    ;; Query execution
    ["duckdb_query"              :int  [:addr :addr :addr]        :int]
+   ["duckdb_interrupt"          :void [:addr]                    nil]
    ["duckdb_destroy_result"     :void [:addr]                    nil]
    ["duckdb_result_error"       :addr [:addr]                    nil]
    ;; Result metadata

@@ -73,35 +73,42 @@
   whose underlying native resource has a closed/open lifecycle."
   (-handle-open? [handle]))
 
-(deftype Db [^long ptr ^AtomicBoolean open?]
+(deftype Db [^long ptr ^AtomicBoolean open? lifecycle-lock]
   IHandle
   (-handle-open? [_] (.get open?))
   AutoCloseable
   (close [_]
-    (when (.compareAndSet open? true false)
-      (with-open [arena (Arena/ofConfined)]
-        (let [p (.allocate arena ffi/VL-ADDR)]
-          (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
-          (ffi/duckdb_close p)))))
+    ;; Connections created from this database share the same lifecycle lock.
+    ;; This prevents closing the parent from freeing a connection while another
+    ;; thread is entering `duckdb_interrupt` or `duckdb_disconnect`.
+    (locking lifecycle-lock
+      (when (.compareAndSet open? true false)
+        (with-open [arena (Arena/ofConfined)]
+          (let [p (.allocate arena ffi/VL-ADDR)]
+            (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+            (ffi/duckdb_close p))))))
   Object
   (toString [_]
     (str "#ducktape/Db[0x" (Long/toHexString ptr)
          (when-not (.get open?) " :closed") "]")))
 
-(deftype Conn [^long ptr ^Db db ^AtomicBoolean open?]
+(deftype Conn [^long ptr ^Db db ^AtomicBoolean open? lifecycle-lock]
   IHandle
   (-handle-open? [_] (.get open?))
   AutoCloseable
   (close [_]
-    (when (.compareAndSet open? true false)
-      ;; Skip disconnect if parent db is closed — `duckdb_close` already
-      ;; freed the native conn, so calling `duckdb_disconnect` would
-      ;; dereference freed memory.
-      (when (.get ^AtomicBoolean (.-open? db))
-        (with-open [arena (Arena/ofConfined)]
-          (let [p (.allocate arena ffi/VL-ADDR)]
-            (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
-            (ffi/duckdb_disconnect p))))))
+    ;; `interrupt!` may run on another thread. Serialize it with disconnect so
+    ;; the native connection pointer cannot be freed during the interrupt call.
+    (locking lifecycle-lock
+      (when (.compareAndSet open? true false)
+        ;; Skip disconnect if parent db is closed — `duckdb_close` already
+        ;; freed the native conn, so calling `duckdb_disconnect` would
+        ;; dereference freed memory.
+        (when (.get ^AtomicBoolean (.-open? db))
+          (with-open [arena (Arena/ofConfined)]
+            (let [p (.allocate arena ffi/VL-ADDR)]
+              (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+              (ffi/duckdb_disconnect p)))))))
   Object
   (toString [_]
     (str "#ducktape/Conn[0x" (Long/toHexString ptr)
@@ -135,6 +142,8 @@
                  (if (nil? conn) "nil" (.getName (class conn)))))))
   (when-not (.get ^AtomicBoolean (.-open? conn))
     (throw (IllegalStateException. "Connection is closed")))
+  (when-not (.get ^AtomicBoolean (.-open? ^Db (.-db conn)))
+    (throw (IllegalStateException. "Parent database is closed")))
   (.-ptr conn))
 
 ;; ---------------------------------------------------------------------------
@@ -181,7 +190,9 @@
                err-str (ffi/read-c-str err-seg)]
            (when err-seg (ffi/duckdb_free err-seg))
            (throw (Exception. (format "Error opening database: %s" err-str)))))
-       (->Db (.address (.get db-out ffi/VL-ADDR 0)) (AtomicBoolean. true)))))
+       (->Db (.address (.get db-out ffi/VL-ADDR 0))
+             (AtomicBoolean. true)
+             (Object.)))))
   (^Db [^String path] (open-db path nil))
   (^Db [] (open-db "")))
 
@@ -207,7 +218,8 @@
         (ffi/duckdb_connect (MemorySegment/ofAddress dbp) p)
         (->Conn (.address (.get p ffi/VL-ADDR 0))
                 db
-                (AtomicBoolean. true))))))
+                (AtomicBoolean. true)
+                (.-lifecycle-lock db))))))
 
 (defn disconnect
   "Disconnect a `Conn`. Idempotent. Returns nil."
@@ -217,6 +229,23 @@
             (str "Expected Conn, got: "
                  (if (nil? conn) "nil" (.getName (class conn)))))))
   (.close conn))
+
+(defn interrupt!
+  "Interrupt the query currently running on `conn`, if any.
+
+  DuckDB permits interruption from a thread other than the query thread. The
+  native call is serialized with `disconnect`, so an interrupt can never race
+  with freeing its connection handle. Repeated calls are safe. Throws if the
+  connection is already closed and returns nil otherwise."
+  [^Conn conn]
+  (when-not (instance? Conn conn)
+    (throw (IllegalArgumentException.
+            (str "Expected Conn, got: "
+                 (if (nil? conn) "nil" (.getName (class conn)))))))
+  (locking (.-lifecycle-lock conn)
+    (let [cp (-conn-ptr conn)]
+      (ffi/duckdb_interrupt (MemorySegment/ofAddress cp))))
+  nil)
 
 ;; ---------------------------------------------------------------------------
 ;; 5. run-query!
