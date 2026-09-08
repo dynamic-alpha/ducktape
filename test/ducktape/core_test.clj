@@ -1077,6 +1077,24 @@
       (is (not (duck/open? conn)))
       (is (not (duck/open? db))))))
 
+(deftest connection-outlives-database-handle-test
+  (let [disconnect ffi/duckdb_disconnect
+        calls (atom 0)]
+    (with-redefs [ffi/duckdb_disconnect (fn [ptr]
+                                        (swap! calls inc)
+                                        (disconnect ptr))]
+      (with-open [db (duck/open-db)
+                  conn (duck/connect db)]
+        (duck/close-db db)
+        (is (false? (duck/open? db)))
+        (is (true? (duck/open? conn)))
+        (is (= 42 (-> (duck/sql->dataset conn "SELECT 42 AS n")
+                      (get "n") first)))
+        (duck/disconnect conn)
+        (duck/disconnect conn)
+        (is (false? (duck/open? conn))))
+      (is (= 1 @calls)))))
+
 (deftest use-after-close-throws-test
   (testing "ops on a closed Conn throw IllegalStateException, not segfault"
     (let [db   (duck/open-db)

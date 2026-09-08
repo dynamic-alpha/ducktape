@@ -94,14 +94,10 @@
   AutoCloseable
   (close [_]
     (when (.compareAndSet open? true false)
-      ;; Skip disconnect if parent db is closed — `duckdb_close` already
-      ;; freed the native conn, so calling `duckdb_disconnect` would
-      ;; dereference freed memory.
-      (when (.get ^AtomicBoolean (.-open? db))
-        (with-open [arena (Arena/ofConfined)]
-          (let [p (.allocate arena ffi/VL-ADDR)]
-            (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
-            (ffi/duckdb_disconnect p))))))
+      (with-open [arena (Arena/ofConfined)]
+        (let [p (.allocate arena ffi/VL-ADDR)]
+          (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+          (ffi/duckdb_disconnect p)))))
   Object
   (toString [_]
     (str "#ducktape/Conn[0x" (Long/toHexString ptr)
