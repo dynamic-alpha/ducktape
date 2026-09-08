@@ -8,7 +8,9 @@
             [tech.v3.datatype.datetime :as dtype-dt]
             [tech.v3.datatype.bitmap :as bitmap]
             [tech.v3.resource :as resource])
-  (:import [java.util UUID]
+  (:import [java.lang AutoCloseable Thread$State]
+           [java.util UUID]
+           [java.util.concurrent CountDownLatch TimeUnit]
            [java.time Instant]
            [java.math BigDecimal BigInteger]
            [java.lang.foreign Arena]
@@ -1079,11 +1081,11 @@
 
 (deftest connection-outlives-database-handle-test
   (let [disconnect ffi/duckdb_disconnect
-        calls (atom 0)]
+        calls      (atom 0)]
     (with-redefs [ffi/duckdb_disconnect (fn [ptr]
-                                        (swap! calls inc)
-                                        (disconnect ptr))]
-      (with-open [db (duck/open-db)
+                                          (swap! calls inc)
+                                          (disconnect ptr))]
+      (with-open [db   (duck/open-db)
                   conn (duck/connect db)]
         (duck/close-db db)
         (is (false? (duck/open? db)))
@@ -1155,6 +1157,604 @@
           (is (true? (duck/open? app)))
           (.close app)
           (is (false? (duck/open? app))))))))
+
+(deftest interrupt-idle-and-completed-query-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (testing "interrupting before a query is a safe no-op"
+      (is (nil? (duck/interrupt! conn)))
+      (is (= 1 (-> (duck/sql->dataset conn "SELECT 1 AS n")
+                   (get "n") first))))
+    (testing "interrupting after completion is repeat safe"
+      (dotimes [_ 3]
+        (is (nil? (duck/interrupt! conn))))
+      (is (= 2 (-> (duck/sql->dataset conn "SELECT 2 AS n")
+                   (get "n") first))))))
+
+(defn- await-lifecycle! [^CountDownLatch latch]
+  (when-not (.await latch 10 TimeUnit/SECONDS)
+    (throw (ex-info "Lifecycle gate timed out" {}))))
+
+(defn- await-condition! [pred]
+  (let [deadline (+ (System/nanoTime) 10000000000)]
+    (loop []
+      (when-not (pred)
+        (when (> (System/nanoTime) deadline)
+          (throw (ex-info "Lifecycle condition timed out" {})))
+        (Thread/sleep 1)
+        (recur)))))
+
+(defn- lifecycle-worker [f]
+  (let [result (promise)
+        thread (Thread. ^Runnable
+                (bound-fn []
+                  (deliver result
+                           (try {:value (f)}
+                                (catch Throwable t {:error t})))))]
+    (.start thread)
+    {:thread thread :result result}))
+
+(defn- join-lifecycle! [{:keys [^Thread thread result]}]
+  (.join thread 10000)
+  (when (.isAlive thread)
+    (is false "Lifecycle worker exceeded its completion deadline")
+    ;; Do not restore FFI vars while a worker can still call them.
+    (.interrupt thread)
+    (.join thread))
+  @result)
+
+(defn- conn-phase [conn]
+  (:phase @(.-state ^ducktape.core.Conn conn)))
+
+(defn- check-closed-operations! [operations]
+  (with-redefs-fn
+    (into {}
+          (for [[sym v] (ns-publics 'ducktape.ffi)
+                :when   (and (.startsWith (str sym) "duckdb_") (fn? @v))]
+            [v (fn [& _] (throw (ex-info "Closed resource reached native code" {:var sym})))]))
+    #(doseq [operation operations]
+       (is (thrown? IllegalStateException (operation))))))
+
+(deftest interrupt-running-query-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [worker   (lifecycle-worker
+                    #(duck/run-query!
+                      conn "SELECT sum(a.i * b.i) FROM range(10000) a(i), range(10000) b(i)"))
+          deadline (+ (System/nanoTime) 5000000000)]
+      (try
+        (loop []
+          (when (and (not (realized? (:result worker)))
+                     (< (System/nanoTime) deadline))
+            (duck/interrupt! conn)
+            (Thread/sleep 1)
+            (recur)))
+        (if (realized? (:result worker))
+          (let [{:keys [error]} (join-lifecycle! worker)]
+            (is (instance? Throwable error))
+            (is (boolean (and error (re-find #"(?i)interrupt" (ex-message error)))))
+            (is (= 42 (-> (duck/sql->dataset conn "SELECT 42 AS n")
+                          (get "n") first))))
+          (do
+            (is false "Query did not respond to repeated interrupts")
+            (duck/disconnect conn)))
+        (finally
+          (when-not (realized? (:result worker)) (duck/disconnect conn))
+          (join-lifecycle! worker))))))
+
+(deftest interrupt-close-race-test
+  (doseq [parent? [false true]]
+    (testing (if parent? "parent close preserves connections" "interrupt races disconnect")
+      (dotimes [_ 20]
+        (with-open [db   (duck/open-db)
+                    conn (duck/connect db)]
+          (let [gate   (CountDownLatch. 1)
+                worker (lifecycle-worker
+                        #(do (await-lifecycle! gate)
+                             (try (duck/interrupt! conn) :interrupted
+                                  (catch IllegalStateException _ :closed))))]
+            (try
+              (.countDown gate)
+              (if parent? (duck/close-db db) (duck/disconnect conn))
+              (let [outcome (join-lifecycle! worker)]
+                (is (nil? (:error outcome)))
+                (is ((if parent? #{:interrupted} #{:interrupted :closed})
+                     (:value outcome))))
+              (when parent?
+                (is (= 7 (-> (duck/sql->dataset conn "SELECT 7 AS n") (get "n") first))))
+              (finally
+                (.countDown gate)
+                (join-lifecycle! worker)))))))))
+
+(deftest close-retries-before-query-native-entry-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [entered    (CountDownLatch. 1)
+          release    (CountDownLatch. 1)
+          exited     (CountDownLatch. 1)
+          interrupts (atom 0)
+          workers    (atom [])
+          query      ffi/duckdb_query
+          interrupt  ffi/duckdb_interrupt
+          disconnect ffi/duckdb_disconnect]
+      (with-redefs [ffi/duckdb_query
+                    (fn [& args]
+                      (.countDown entered)
+                      (try
+                        (await-lifecycle! release)
+                        (apply query args)
+                        (finally (.countDown exited))))
+                    ffi/duckdb_interrupt
+                    (fn [& args]
+                      (swap! interrupts inc)
+                      (apply interrupt args))
+                    ffi/duckdb_disconnect
+                    (fn [& args]
+                      (is (zero? (.getCount exited)) "native query exits before disconnect")
+                      (await-lifecycle! exited)
+                      (apply disconnect args))]
+        (try
+          (let [query-worker (lifecycle-worker
+                              #(duck/run-query!
+                                conn "SELECT sum(a.i * b.i) FROM range(10000) a(i), range(10000) b(i)"))]
+            (swap! workers conj query-worker)
+            (await-lifecycle! entered)
+            (is (seq (:active @(.-state ^ducktape.core.Conn conn))))
+            (let [closer (lifecycle-worker #(duck/disconnect conn))]
+              (swap! workers conj closer)
+              (await-condition! #(>= @interrupts 2))
+              (is (= :closing (conn-phase conn)))
+              (is (not (realized? (:result closer))))
+              (is (thrown? IllegalStateException (duck/interrupt! conn)))
+              (is (thrown? IllegalStateException (duck/run-query! conn "SELECT 1")))
+              (is (thrown? IllegalStateException (duck/prepare conn "SELECT 1")))
+              (.countDown release)
+              (let [{:keys [error]} (join-lifecycle! query-worker)]
+                (is (boolean (and error (re-find #"(?i)interrupt" (ex-message error))))))
+              (is (nil? (:error (join-lifecycle! closer))))
+              (is (= :closed (conn-phase conn)))
+              (is (empty? (:active @(.-state ^ducktape.core.Conn conn))))))
+          (finally
+            (.countDown release)
+            (doseq [worker @workers] (join-lifecycle! worker))))))))
+
+(deftest concurrent-disconnect-waits-for-native-completion-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [entered    (CountDownLatch. 1)
+          release    (CountDownLatch. 1)
+          calls      (atom 0)
+          workers    (atom [])
+          disconnect ffi/duckdb_disconnect]
+      (with-redefs [ffi/duckdb_disconnect
+                    (fn [& args]
+                      (swap! calls inc)
+                      (.countDown entered)
+                      (await-lifecycle! release)
+                      (apply disconnect args))]
+        (try
+          (let [first-close (lifecycle-worker #(duck/disconnect conn))]
+            (swap! workers conj first-close)
+            (await-lifecycle! entered)
+            (let [second-close (lifecycle-worker #(do (duck/disconnect conn)
+                                                      (.isInterrupted (Thread/currentThread))))]
+              (swap! workers conj second-close)
+              (await-condition! #(= Thread$State/WAITING
+                                    (.getState ^Thread (:thread second-close))))
+              (is (= :closing (conn-phase conn)))
+              (is (not (realized? (:result first-close))))
+              (is (not (realized? (:result second-close))))
+              (is (thrown? IllegalStateException (duck/interrupt! conn)))
+              (is (= 1 @calls))
+              (.interrupt ^Thread (:thread second-close))
+              (.countDown release)
+              (doseq [worker @workers]
+                (is (nil? (:error (join-lifecycle! worker)))))
+              (is (true? (:value (join-lifecycle! second-close))))
+              (is (= :closed (conn-phase conn)))
+              (duck/disconnect conn)
+              (is (= 1 @calls))))
+          (finally
+            (.countDown release)
+            (doseq [worker @workers] (join-lifecycle! worker))))))))
+
+(deftest interrupt-excludes-native-disconnect-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [entered       (CountDownLatch. 1)
+          release       (CountDownLatch. 1)
+          exited        (CountDownLatch. 1)
+          disconnected? (atom false)
+          workers       (atom [])
+          interrupt     ffi/duckdb_interrupt
+          disconnect    ffi/duckdb_disconnect]
+      (with-redefs [ffi/duckdb_interrupt
+                    (fn [& args]
+                      (.countDown entered)
+                      (try (await-lifecycle! release)
+                           (apply interrupt args)
+                           (finally (.countDown exited))))
+                    ffi/duckdb_disconnect
+                    (fn [& args]
+                      (reset! disconnected? true)
+                      (is (zero? (.getCount exited)))
+                      (await-lifecycle! exited)
+                      (apply disconnect args))]
+        (try
+          (swap! workers conj (lifecycle-worker #(duck/interrupt! conn)))
+          (await-lifecycle! entered)
+          (let [closer (lifecycle-worker #(duck/disconnect conn))]
+            (swap! workers conj closer)
+            (await-condition! #(= Thread$State/BLOCKED (.getState ^Thread (:thread closer))))
+            (is (false? @disconnected?))
+            (is (not (realized? (:result closer))))
+            (.countDown release)
+            (doseq [worker @workers] (is (nil? (:error (join-lifecycle! worker)))))
+            (is (true? @disconnected?)))
+          (finally
+            (.countDown release)
+            (doseq [worker @workers] (join-lifecycle! worker))))))))
+
+(defn- check-close-drains-operation! [conn native-var operation]
+  (let [entered          (CountDownLatch. 1)
+        release          (CountDownLatch. 1)
+        exited           (CountDownLatch. 1)
+        disconnected?    (atom false)
+        workers          (atom [])
+        operation-thread (atom nil)
+        guarded          (into {}
+                               (for [v    [#'ffi/duckdb_appender_flush
+                                           #'ffi/duckdb_appender_destroy
+                                           #'ffi/duckdb_destroy_data_chunk
+                                           #'ffi/duckdb_destroy_prepare
+                                           #'ffi/duckdb_destroy_result
+                                           #'ffi/duckdb_disconnect]
+                                     :let [native @v]]
+                                 [v (fn [& args]
+                                      (when-not (identical? @operation-thread (Thread/currentThread))
+                                        (is (zero? (.getCount exited)) "cleanup follows operation completion")
+                                        (await-lifecycle! exited))
+                                      (when (= v #'ffi/duckdb_disconnect)
+                                        (reset! disconnected? true))
+                                      (apply native args))]))
+        native           (get guarded native-var @native-var)
+        gated            (fn [& args]
+                           (.countDown entered)
+                           (await-lifecycle! release)
+                           (apply native args))]
+    (with-redefs-fn
+      (assoc guarded native-var
+             (if (= native-var #'ffi/duckdb_bind_int64)
+               (fn [stmt ^long index ^long value] (gated stmt index value))
+               gated))
+      (fn []
+        (try
+          (let [worker (lifecycle-worker
+                        #(try
+                           (reset! operation-thread (Thread/currentThread))
+                           (operation)
+                           (finally (.countDown exited))))]
+            (swap! workers conj worker)
+            (await-lifecycle! entered)
+            (let [closer (lifecycle-worker #(duck/disconnect conn))]
+              (swap! workers conj closer)
+              (await-condition! #(= :closing (conn-phase conn)))
+              (is (false? @disconnected?))
+              (is (not (realized? (:result closer))))
+              (.countDown release)
+              (let [{:keys [error]} (join-lifecycle! worker)]
+                (is (or (nil? error)
+                        (boolean (re-find #"(?i)interrupt" (ex-message error))))
+                    (str error)))
+              (is (nil? (:error (join-lifecycle! closer))))
+              (is (true? @disconnected?))))
+          (finally
+            (.countDown release)
+            (doseq [worker @workers] (join-lifecycle! worker))))))))
+
+(deftest close-drains-appender-operations-test
+  (doseq [op [:append :flush]]
+    (testing (name op)
+      (with-open [db   (duck/open-db)
+                  conn (duck/connect db)]
+        (let [sample (stream-schema-sample "close_app")]
+          (duck/create-table! conn sample)
+          (with-open [app (duck/open-appender conn sample)]
+            (check-close-drains-operation!
+             conn
+             (if (= op :append) #'ffi/duckdb_append_data_chunk #'ffi/duckdb_appender_flush)
+             #(if (= op :append)
+                (duck/append-dataset! app sample)
+                (duck/flush-appender! app)))
+            (check-closed-operations!
+             [#(duck/append-dataset! app sample)
+              #(duck/flush-appender! app)])))))))
+
+(deftest close-drains-prepared-operations-test
+  (doseq [[sql args native-var]
+          [["SELECT 1" [] #'ffi/duckdb_execute_pending]
+           ["SELECT $1::BIGINT" [1] #'ffi/duckdb_bind_int64]
+           ["SELECT $1::BIGINT + $2::BIGINT" [1 2] #'ffi/duckdb_bind_int64]]]
+    (testing sql
+      (with-open [db   (duck/open-db)
+                  conn (duck/connect db)
+                  stmt (duck/prepare conn sql)]
+        (check-close-drains-operation! conn native-var #(apply stmt args))
+        (check-closed-operations! [#(apply stmt args)])))))
+
+(deftest close-drains-result-reduction-test
+  (with-open [db     (duck/open-db)
+              conn   (duck/connect db)
+              result (duck/sql->datasets conn "SELECT * FROM range(10)")]
+    (check-close-drains-operation! conn #'ffi/duckdb_fetch_chunk
+                                   #(reduce (fn [n chunk] (+ n (ds/row-count chunk))) 0 result))
+    (check-closed-operations!
+     [#(.get ^java.util.function.Supplier result)
+      #(reduce conj [] result)])))
+
+(deftest close-from-result-reducer-throws-test
+  (with-open [db     (duck/open-db)
+              conn   (duck/connect db)
+              result (duck/sql->datasets conn "SELECT * FROM range(10)" {:reduce-type :zero-copy})]
+    (let [worker (lifecycle-worker
+                  #(reduce (fn [n chunk]
+                             (is (thrown? IllegalStateException (duck/disconnect conn)))
+                             (is (thrown? IllegalStateException (.close result)))
+                             (+ n (ds/row-count chunk)))
+                           0 result))]
+      (try
+        (is (= {:value 10} (join-lifecycle! worker)))
+        (is (duck/open? conn))
+        (finally (join-lifecycle! worker))))))
+
+(deftest connection-closes-dependents-exactly-once-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [sample         (stream-schema-sample "dependent_app")
+          _              (duck/create-table! conn sample)
+          app            (duck/open-appender conn sample)
+          stmt           (duck/prepare conn "SELECT $1::BIGINT")
+          result         (stmt 1)
+          calls          (atom [])
+          destroy-app    ffi/duckdb_appender_destroy
+          destroy-stmt   ffi/duckdb_destroy_prepare
+          destroy-result ffi/duckdb_destroy_result
+          disconnect     ffi/duckdb_disconnect]
+      (with-redefs [ffi/duckdb_appender_destroy
+                    (fn [& args] (swap! calls conj :app) (apply destroy-app args))
+                    ffi/duckdb_destroy_prepare
+                    (fn [& args] (swap! calls conj :stmt) (apply destroy-stmt args))
+                    ffi/duckdb_destroy_result
+                    (fn [& args] (swap! calls conj :result) (apply destroy-result args))
+                    ffi/duckdb_disconnect
+                    (fn [& args] (swap! calls conj :conn) (apply disconnect args))]
+        (let [worker (lifecycle-worker #(duck/disconnect conn))]
+          (try
+            (is (nil? (:error (join-lifecycle! worker))))
+            (is (= {:app 1 :stmt 1 :result 1 :conn 1} (frequencies @calls)))
+            (is (= :conn (last @calls)))
+            (doseq [child [app stmt result]] (.close ^AutoCloseable child))
+            (duck/disconnect conn)
+            (is (= 4 (count @calls)))
+            (check-closed-operations!
+             [#(duck/append-dataset! app sample)
+              #(duck/flush-appender! app)
+              #(stmt 2)
+              #(.get ^java.util.function.Supplier result)
+              #(reduce conj [] result)])
+            (finally (join-lifecycle! worker))))))))
+
+(deftest dependent-cross-thread-close-and-use-after-close-test
+  (with-open [db   (duck/open-db)
+              conn (duck/connect db)]
+    (let [stmt   (duck/prepare conn "SELECT 1")
+          result (stmt)
+          worker (lifecycle-worker
+                  #(do (.close ^AutoCloseable result)
+                       (.close ^AutoCloseable stmt)))]
+      (try
+        (is (nil? (:error (join-lifecycle! worker))))
+        (check-closed-operations!
+         [#(stmt)
+          #(.get ^java.util.function.Supplier result)
+          #(reduce conj [] result)])
+        (is (= 2 (-> (duck/sql->dataset conn "SELECT 2 AS n") (get "n") first)))
+        (finally
+          (join-lifecycle! worker)
+          (.close ^AutoCloseable result)
+          (.close ^AutoCloseable stmt))))))
+
+(deftest connection-cleanup-failure-drains-all-children-test
+  (with-open [db (duck/open-db)]
+    (let [conn           (duck/connect db)
+          sample         (stream-schema-sample "failed_cleanup")
+          _              (duck/create-table! conn sample)
+          app            (duck/open-appender conn sample)
+          stmt           (duck/prepare conn "SELECT 1")
+          result         (stmt)
+          failure        (ex-info "cleanup failure" {})
+          calls          (atom [])
+          destroy-app    ffi/duckdb_appender_destroy
+          destroy-stmt   ffi/duckdb_destroy_prepare
+          destroy-result ffi/duckdb_destroy_result
+          disconnect     ffi/duckdb_disconnect]
+      (with-redefs [ffi/duckdb_appender_destroy
+                    (fn [& args] (swap! calls conj :app) (apply destroy-app args))
+                    ffi/duckdb_destroy_prepare
+                    (fn [& args] (swap! calls conj :stmt) (apply destroy-stmt args))
+                    ffi/duckdb_destroy_result
+                    (fn [& args]
+                      (swap! calls conj :result)
+                      (apply destroy-result args)
+                      (throw failure))
+                    ffi/duckdb_disconnect
+                    (fn [& args] (swap! calls conj :conn) (apply disconnect args))]
+        (try
+          (let [worker (lifecycle-worker #(duck/disconnect conn))]
+            (try
+              (is (identical? failure (:error (join-lifecycle! worker))))
+              (finally (join-lifecycle! worker))))
+          (is (= :closed (conn-phase conn)))
+          (is (= {:app 1 :stmt 1 :result 1 :conn 1} (frequencies @calls)))
+          (is (= :conn (last @calls)))
+          (is (empty? (:children @(.-state ^ducktape.core.Conn conn))))
+          (finally
+            (doseq [child [app stmt result]]
+              (try (.close ^AutoCloseable child) (catch Throwable _)))
+            (try (duck/disconnect conn) (catch Throwable _))))))))
+
+(deftest database-connect-excludes-close-test
+  (let [db      (duck/open-db)
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        exited  (CountDownLatch. 1)
+        closed? (atom false)
+        workers (atom [])
+        connect ffi/duckdb_connect
+        close   ffi/duckdb_close]
+    (with-redefs [ffi/duckdb_connect
+                  (fn [& args]
+                    (.countDown entered)
+                    (try (await-lifecycle! release)
+                         (when @closed?
+                           (throw (ex-info "Native connect entered after database close" {})))
+                         (apply connect args)
+                         (finally (.countDown exited))))
+                  ffi/duckdb_close
+                  (fn [& args]
+                    (reset! closed? true)
+                    (is (zero? (.getCount exited)))
+                    (await-lifecycle! exited)
+                    (apply close args))]
+      (try
+        (let [connector (lifecycle-worker #(duck/connect db))]
+          (swap! workers conj connector)
+          (await-lifecycle! entered)
+          (let [closer (lifecycle-worker #(duck/close-db db))]
+            (swap! workers conj closer)
+            (await-condition! #(= Thread$State/BLOCKED (.getState ^Thread (:thread closer))))
+            (is (false? @closed?))
+            (.countDown release)
+            (let [{:keys [value error]} (join-lifecycle! connector)]
+              (is (nil? error))
+              (is (nil? (:error (join-lifecycle! closer))))
+              (when value
+                (is (nil? (duck/interrupt! value)))
+                (is (= 1 (-> (duck/sql->dataset value "SELECT 1 AS n") (get "n") first)))))
+            (is (thrown? IllegalStateException (duck/connect db)))))
+        (finally
+          (.countDown release)
+          (doseq [worker @workers] (join-lifecycle! worker))
+          (when-let [conn (:value @(:result (first @workers)))]
+            (duck/disconnect conn))
+          (duck/close-db db))))))
+
+(deftest close-drains-resource-registration-test
+  (doseq [kind [:appender :statement :result]]
+    (testing (name kind)
+      (with-open [db   (duck/open-db)
+                  conn (duck/connect db)]
+        (duck/run-query! conn "CREATE TABLE registration (n BIGINT)")
+        (let [[create-var destroy-var create]
+              (case kind
+                :appender [#'ffi/duckdb_appender_create #'ffi/duckdb_appender_destroy
+                           #(duck/open-appender conn (ds/->dataset {:n [1]}) {:table-name "registration"})]
+                :statement [#'ffi/duckdb_prepare #'ffi/duckdb_destroy_prepare
+                            #(duck/prepare conn "SELECT 1")]
+                :result [#'ffi/duckdb_execute_pending #'ffi/duckdb_destroy_result
+                         #(duck/sql->datasets conn "SELECT 1")])
+              native-create                   @create-var
+              native-destroy                  @destroy-var
+              disconnect                      ffi/duckdb_disconnect
+              created                         (CountDownLatch. 1)
+              release                         (CountDownLatch. 1)
+              destroyed                       (atom 0)
+              workers                         (atom [])]
+          (with-redefs-fn
+            {create-var              (fn [& args]
+                                       (let [rc (apply native-create args)]
+                                         (.countDown created)
+                                         (await-lifecycle! release)
+                                         rc))
+             destroy-var             (fn [& args]
+                                       (swap! destroyed inc)
+                                       (apply native-destroy args))
+             #'ffi/duckdb_disconnect (fn [ptr]
+                                       (is (= 1 @destroyed))
+                                       (disconnect ptr))}
+            (fn []
+              (try
+                (let [creator (lifecycle-worker create)]
+                  (swap! workers conj creator)
+                  (await-lifecycle! created)
+                  (let [closer (lifecycle-worker #(duck/disconnect conn))]
+                    (swap! workers conj closer)
+                    (await-condition! #(= :closing (conn-phase conn)))
+                    (is (zero? @destroyed))
+                    (is (not (realized? (:result closer))))
+                    (.countDown release)
+                    (is (nil? (:error (join-lifecycle! creator))))
+                    (doseq [worker @workers]
+                      (is (nil? (:error (join-lifecycle! worker)))))
+                    (is (= 1 @destroyed))))
+                (finally
+                  (.countDown release)
+                  (doseq [worker @workers] (join-lifecycle! worker)))))))))))
+
+(deftest failed-clone-drains-sibling-worker-test
+  (with-open [db     (duck/open-db)
+              conn   (duck/connect db)
+              result (duck/sql->datasets conn "SELECT 1 AS a, 2 AS b")]
+    (let [clone          dt/clone
+          destroy        ffi/duckdb_destroy_data_chunk
+          calls          (atom 0)
+          second-entered (CountDownLatch. 1)
+          release        (CountDownLatch. 1)
+          exited         (atom false)
+          destroyed      (promise)
+          workers        (atom [])]
+      (with-redefs [dt/clone (fn [data]
+                               (if (= 1 (swap! calls inc))
+                                 (do (await-lifecycle! second-entered)
+                                     (throw (ex-info "clone failed" {})))
+                                 (try
+                                   (.countDown second-entered)
+                                   (await-lifecycle! release)
+                                   (clone data)
+                                   (finally (reset! exited true)))))
+                    ffi/duckdb_destroy_data_chunk
+                    (fn [ptr]
+                      (is @exited "native chunk survives all clone workers")
+                      (destroy ptr)
+                      (deliver destroyed true))]
+        (try
+          (let [worker (lifecycle-worker #(.get ^java.util.function.Supplier result))]
+            (swap! workers conj worker)
+            (await-lifecycle! second-entered)
+            (let [closer (lifecycle-worker #(duck/disconnect conn))]
+              (swap! workers conj closer)
+              (await-condition! #(= :closing (conn-phase conn)))
+              (is (not (realized? destroyed)))
+              (is (not (realized? (:result closer))))
+              (.countDown release)
+              (is (some? (:error (join-lifecycle! worker))))
+              (is (nil? (:error (join-lifecycle! closer))))
+              (is (true? @destroyed))))
+          (finally
+            (.countDown release)
+            (doseq [worker @workers] (join-lifecycle! worker))))))))
+
+(deftest interrupt-invalid-or-closed-handle-test
+  (testing "invalid handles fail before entering native code"
+    (is (thrown? IllegalArgumentException (duck/interrupt! nil)))
+    (is (thrown? IllegalArgumentException (duck/interrupt! 42))))
+  (testing "a closed connection cannot be interrupted"
+    (let [db   (duck/open-db)
+          conn (duck/connect db)]
+      (duck/disconnect conn)
+      (is (thrown-with-msg? IllegalStateException #"Connection is closed"
+                            (duck/interrupt! conn)))
+      (duck/close-db db))))
 
 ;; ---------------------------------------------------------------------------
 ;; Transactions — transact! / with-tx

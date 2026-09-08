@@ -73,35 +73,163 @@
   whose underlying native resource has a closed/open lifecycle."
   (-handle-open? [handle]))
 
+(def ^:dynamic ^:private *conn-operations* [])
+
+(defn- conn-active? [state]
+  (pos? (get (:active @state) (Thread/currentThread) 0)))
+
+(defn- wait-for-conn! [state interrupted? milliseconds]
+  (try
+    (.wait ^Object state (long milliseconds))
+    (catch InterruptedException _ (vreset! interrupted? true))))
+
+(defn- call-with-conn-state [state cleanup? f]
+  (let [thread       (Thread/currentThread)
+        interrupted? (volatile! false)]
+    (try
+      (when (locking state
+              (if (or (= :open (:phase @state)) (conn-active? state))
+                (do (swap! state update-in [:active thread] (fnil inc 0)) true)
+                (if cleanup?
+                  (do (while (= :closing (:phase @state))
+                        (wait-for-conn! state interrupted? 0))
+                      false)
+                  (throw (IllegalStateException. "Connection is closed or closing")))))
+        (let [lease (atom true)]
+          (binding [*conn-operations* (conj *conn-operations* [state lease])]
+            (try
+              (f)
+              (finally
+                (reset! lease false)
+                (locking state
+                  (swap! state update :active
+                         (fn [active]
+                           (let [n (dec (get active thread))]
+                             (if (zero? n) (dissoc active thread) (assoc active thread n)))))
+                  (.notifyAll ^Object state)))))))
+      (finally
+        (when @interrupted? (.interrupt thread))))))
+
+(defn- attempt-cleanup! [failure f]
+  (try (f)
+       (catch Throwable t
+         (if-let [^Throwable first-error @failure]
+           (when-not (identical? first-error t) (.addSuppressed first-error t))
+           (vreset! failure t)))))
+
+(defn- close-conn-state! [state interrupt-fn destroy-fn]
+  (let [interrupted? (volatile! false)
+        thread       (Thread/currentThread)]
+    (try
+      (when (locking state
+              (when (or (conn-active? state)
+                        (some (fn [[owner lease]] (and (identical? owner state) @lease))
+                              *conn-operations*))
+                (throw (IllegalStateException. "Cannot close a connection from its active operation")))
+              (if (= :open (:phase @state))
+                (do (swap! state assoc :phase :closing) true)
+                (do (while (= :closing (:phase @state))
+                      (wait-for-conn! state interrupted? 0))
+                    false)))
+        (let [failure (volatile! nil)]
+          (try
+            ;; Query entry can clear an earlier interrupt; retry until every lease exits.
+            (loop []
+              (when (locking state (seq (:active @state)))
+                (attempt-cleanup! failure interrupt-fn)
+                (locking state
+                  (when (seq (:active @state))
+                    (wait-for-conn! state interrupted? 10)))
+                (recur)))
+            (doseq [cleanup (rseq (:children @state))]
+              (attempt-cleanup! failure cleanup))
+            (finally
+              (attempt-cleanup! failure destroy-fn)
+              (locking state
+                (swap! state assoc :phase :closed :children [] :failure @failure)
+                (.notifyAll ^Object state))))))
+      (when-let [failure (:failure @state)] (throw failure))
+      nil
+      (finally
+        (when @interrupted? (.interrupt thread))))))
+
 (deftype Db [^long ptr ^AtomicBoolean open?]
   IHandle
   (-handle-open? [_] (.get open?))
   AutoCloseable
   (close [_]
-    (when (.compareAndSet open? true false)
-      (with-open [arena (Arena/ofConfined)]
-        (let [p (.allocate arena ffi/VL-ADDR)]
-          (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
-          (ffi/duckdb_close p)))))
+    (locking open?
+      (when (.compareAndSet open? true false)
+        (with-open [arena (Arena/ofConfined)]
+          (let [p (.allocate arena ffi/VL-ADDR)]
+            (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
+            (ffi/duckdb_close p))))))
   Object
   (toString [_]
     (str "#ducktape/Db[0x" (Long/toHexString ptr)
          (when-not (.get open?) " :closed") "]")))
 
-(deftype Conn [^long ptr ^Db db ^AtomicBoolean open?]
+(deftype Conn [^long ptr ^Db db state]
   IHandle
-  (-handle-open? [_] (.get open?))
+  (-handle-open? [_] (= :open (:phase @state)))
   AutoCloseable
   (close [_]
-    (when (.compareAndSet open? true false)
-      (with-open [arena (Arena/ofConfined)]
+    (close-conn-state!
+     state
+     #(ffi/duckdb_interrupt (MemorySegment/ofAddress ptr))
+     #(with-open [arena (Arena/ofConfined)]
         (let [p (.allocate arena ffi/VL-ADDR)]
           (.set p ffi/VL-ADDR 0 (MemorySegment/ofAddress ptr))
           (ffi/duckdb_disconnect p)))))
   Object
   (toString [_]
     (str "#ducktape/Conn[0x" (Long/toHexString ptr)
-         (when-not (.get open?) " :closed") "]")))
+         (when-not (= :open (:phase @state)) (str " :" (name (:phase @state)))) "]")))
+
+(defn- conn-state [^Conn conn]
+  (when-not (instance? Conn conn)
+    (throw (IllegalArgumentException.
+            (str "Expected Conn, got: "
+                 (if (nil? conn) "nil" (.getName (class conn)))))))
+  (.-state conn))
+
+(defmacro ^:private with-conn [conn & body]
+  `(call-with-conn-state (conn-state ~conn) false (fn [] ~@body)))
+
+(defn- close-resource! [state resource]
+  (locking resource
+    (when (:open? @resource)
+      (when (identical? (:owner @resource) (Thread/currentThread))
+        (throw (IllegalStateException. "Cannot close a resource from its active operation")))
+      (let [cleanup (:cleanup @resource)]
+        (swap! resource assoc :open? false)
+        (try (cleanup)
+             (finally
+               (locking state
+                 (swap! state update :children
+                        (fn [children] (filterv #(not (identical? % (:close @resource))) children))))))))))
+
+(defn- register-resource! [^Conn conn label cleanup]
+  (let [state    (conn-state conn)
+        resource (atom {:open? true :label label :cleanup cleanup})
+        close    #(close-resource! state resource)]
+    (swap! resource assoc :close close)
+    (locking state (swap! state update :children conj close))
+    resource))
+
+(defn- call-with-resource [^Conn conn resource f]
+  (with-conn conn
+    (locking resource
+      (when-not (:open? @resource)
+        (throw (IllegalStateException. (str (:label @resource) " is closed"))))
+      (let [owner (:owner @resource)]
+        (swap! resource assoc :owner (Thread/currentThread))
+        (try (f)
+             (finally (swap! resource assoc :owner owner)))))))
+
+(defn- release-resource! [^Conn conn resource]
+  (let [state (conn-state conn)]
+    (call-with-conn-state state true #(close-resource! state resource))))
 
 (defn open?
   "Return true if the handle's native resource is still open."
@@ -129,8 +257,8 @@
     (throw (IllegalArgumentException.
             (str "Expected Conn, got: "
                  (if (nil? conn) "nil" (.getName (class conn)))))))
-  (when-not (.get ^AtomicBoolean (.-open? conn))
-    (throw (IllegalStateException. "Connection is closed")))
+  (when-not (conn-active? (conn-state conn))
+    (throw (IllegalStateException. "Connection operation is not active")))
   (.-ptr conn))
 
 ;; ---------------------------------------------------------------------------
@@ -197,13 +325,17 @@
 (defn connect
   "Open a connection to `db`. Returns an `AutoCloseable` `Conn`."
   ^Conn [^Db db]
-  (let [dbp (-db-ptr db)]
-    (with-open [arena (Arena/ofConfined)]
-      (let [p (.allocate arena ffi/VL-ADDR)]
-        (ffi/duckdb_connect (MemorySegment/ofAddress dbp) p)
-        (->Conn (.address (.get p ffi/VL-ADDR 0))
-                db
-                (AtomicBoolean. true))))))
+  (-db-ptr db)
+  (let [state (.-open? db)]
+    (locking state
+      (let [dbp (-db-ptr db)]
+        (with-open [arena (Arena/ofConfined)]
+          (let [p  (.allocate arena ffi/VL-ADDR)
+                rc (ffi/duckdb_connect (MemorySegment/ofAddress dbp) p)]
+            (when-not (== (int rc) ffi/DuckDBSuccess)
+              (throw (Exception. "duckdb_connect failed")))
+            (->Conn (.address (.get p ffi/VL-ADDR 0)) db
+                    (atom {:phase :open :active {} :children []}))))))))
 
 (defn disconnect
   "Disconnect a `Conn`. Idempotent. Returns nil."
@@ -214,6 +346,17 @@
                  (if (nil? conn) "nil" (.getName (class conn)))))))
   (.close conn))
 
+(defn interrupt!
+  "Interrupt the query currently running on `conn`, if any. Returns nil.
+  Throws if the connection is closed or closing."
+  [^Conn conn]
+  (let [state (conn-state conn)]
+    (locking state
+      (when-not (= :open (:phase @state))
+        (throw (IllegalStateException. "Connection is closed or closing")))
+      (ffi/duckdb_interrupt (MemorySegment/ofAddress (.-ptr conn)))))
+  nil)
+
 ;; ---------------------------------------------------------------------------
 ;; 5. run-query!
 ;; ---------------------------------------------------------------------------
@@ -221,19 +364,17 @@
 (defn run-query!
   "Execute a SQL statement, ignoring results. Used for DDL."
   [^Conn conn ^String sql]
-  (with-open [arena (Arena/ofConfined)]
-    (let [cp     (-conn-ptr conn)
-          result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
-          rc     (ffi/duckdb_query
-                  (MemorySegment/ofAddress cp)
-                  (ffi/alloc-c-str arena sql)
-                  result)]
-      (when-not (== rc ffi/DuckDBSuccess)
-        (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result))]
-          (ffi/duckdb_destroy_result result)
-          (throw (Exception. err))))
-      (ffi/duckdb_destroy_result result)
-      :ok)))
+  (with-conn conn
+    (with-open [arena (Arena/ofConfined)]
+      (let [cp     (-conn-ptr conn)
+            result (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))]
+        (try
+          (let [rc (ffi/duckdb_query (MemorySegment/ofAddress cp)
+                                     (ffi/alloc-c-str arena sql) result)]
+            (when-not (== rc ffi/DuckDBSuccess)
+              (throw (Exception. (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result)))))
+            :ok)
+          (finally (ffi/duckdb_destroy_result result)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 5b. Transactions — transact! / with-tx
@@ -1081,48 +1222,29 @@
 
   Returns the number of rows written."
   ([^Conn conn dataset options]
-   (let [table-name (sql/table-name dataset options)
-         state      (setup-appender-state! conn table-name dataset)]
-     (try
-       ;; ofShared: allows parallel string/uuid writes from hamf/pgroups fork-join threads
-       (with-open [arena (Arena/ofShared)]
-         (write-dataset-chunks! arena state dataset))
-       (finally
-         (destroy-appender-state! state)))))
+   (with-conn conn
+     (let [table-name (sql/table-name dataset options)
+           state      (setup-appender-state! conn table-name dataset)]
+       (try
+         (with-open [arena (Arena/ofShared)]
+           (write-dataset-chunks! arena state dataset))
+         (finally
+           (destroy-appender-state! state))))))
   ([conn dataset] (insert-dataset! conn dataset nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; 7c. Appender — long-lived, reusable streaming writer
 ;; ---------------------------------------------------------------------------
 
-(deftype Appender [state ^AtomicBoolean open?]
+(deftype Appender [^Conn conn state resource]
   IHandle
-  (-handle-open? [_] (.get open?))
+  (-handle-open? [_] (:open? @resource))
   AutoCloseable
-  (close [_]
-    (when (.compareAndSet open? true false)
-      ;; `duckdb_appender_destroy` flushes implicitly but throws away the
-      ;; return code — silently dropping rows on a constraint violation.
-      ;; Flush explicitly first so we can surface the error, then tear
-      ;; the appender down regardless. Mirrors the poisoning logic in
-      ;; `flush-appender!`.
-      (let [^MemorySegment app (:appender state)
-            rc                 (ffi/duckdb_appender_flush app)]
-        (if (== (int rc) ffi/DuckDBSuccess)
-          (destroy-appender-state! state)
-          (let [err (ffi/read-c-str
-                     ^MemorySegment (ffi/duckdb_appender_error app))]
-            (try (destroy-appender-state! state) (catch Throwable _))
-            (throw (Exception. (str "Appender close-flush failed: " err))))))))
+  (close [_] (release-resource! conn resource))
   Object
   (toString [_]
     (str "#duckdb-appender[\"" (:table-name state) "\""
-         (when-not (.get open?) " :closed") "]")))
-
-(defn- -check-appender-open! [^Appender app]
-  (when-not (.get ^AtomicBoolean (.-open? app))
-    (throw (IllegalStateException.
-            "Appender is closed (or was poisoned by a failed flush)."))))
+         (when-not (:open? @resource) " :closed") "]")))
 
 (defn open-appender
   "Open a long-lived appender for `schema-dataset`'s table on `conn`.
@@ -1151,9 +1273,20 @@
   (^AutoCloseable [conn schema-dataset]
    (open-appender conn schema-dataset nil))
   (^AutoCloseable [^Conn conn schema-dataset options]
-   (let [table-name (sql/table-name schema-dataset options)
-         state      (setup-appender-state! conn table-name schema-dataset)]
-     (->Appender state (AtomicBoolean. true)))))
+   (with-conn conn
+     (let [table-name (sql/table-name schema-dataset options)
+           state      (setup-appender-state! conn table-name schema-dataset)
+           resource   (register-resource!
+                       conn "Appender"
+                       #(try
+                          (let [app (:appender state)
+                                rc  (ffi/duckdb_appender_flush app)]
+                            (when-not (== (int rc) ffi/DuckDBSuccess)
+                              (throw (Exception.
+                                      (str "Appender close-flush failed: "
+                                           (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app)))))))
+                          (finally (destroy-appender-state! state))))]
+       (->Appender conn state resource)))))
 
 (defn append-dataset!
   "Append `dataset` to the open `appender`. `dataset` must have the same
@@ -1165,18 +1298,20 @@
   Throws `IllegalStateException` if the appender has been closed, or
   `IllegalArgumentException` if the dataset schema does not match."
   [^Appender appender dataset]
-  (-check-appender-open! appender)
-  (let [state           (.-state appender)
-        expected-dtypes (:dtypes state)
-        batch-dtypes    (mapv (comp packing/unpack-datatype dt/elemwise-datatype)
-                              (ds/columns dataset))]
-    (when-not (= batch-dtypes expected-dtypes)
-      (throw (IllegalArgumentException.
-              (str "Batch schema does not match appender schema for table \""
-                   (:table-name state) "\". Expected dtypes "
-                   expected-dtypes " but got " batch-dtypes "."))))
-    (with-open [arena (Arena/ofShared)]
-      (write-dataset-chunks! arena state dataset))))
+  (call-with-resource
+   (.-conn appender) (.-resource appender)
+   (fn []
+     (let [state           (.-state appender)
+           expected-dtypes (:dtypes state)
+           batch-dtypes    (mapv (comp packing/unpack-datatype dt/elemwise-datatype)
+                                 (ds/columns dataset))]
+       (when-not (= batch-dtypes expected-dtypes)
+         (throw (IllegalArgumentException.
+                 (str "Batch schema does not match appender schema for table \""
+                      (:table-name state) "\". Expected dtypes "
+                      expected-dtypes " but got " batch-dtypes "."))))
+       (with-open [arena (Arena/ofShared)]
+         (write-dataset-chunks! arena state dataset))))))
 
 (defn flush-appender!
   "Flush the appender's internal DuckDB buffer, committing buffered rows
@@ -1191,17 +1326,20 @@
 
   Returns `:ok` on success."
   [^Appender appender]
-  (-check-appender-open! appender)
-  (let [state              (.-state appender)
-        ^MemorySegment app (:appender state)
-        rc                 (ffi/duckdb_appender_flush app)]
-    (when-not (== (int rc) ffi/DuckDBSuccess)
-      (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app))]
-        ;; Poison: destroy state exactly once (CAS in close() will then no-op).
-        (when (.compareAndSet ^AtomicBoolean (.-open? appender) true false)
-          (try (destroy-appender-state! state) (catch Throwable _)))
-        (throw (Exception. (str "Appender flush failed: " err)))))
-    :ok))
+  (let [conn     (.-conn appender)
+        resource (.-resource appender)]
+    (call-with-resource
+     conn resource
+     (fn []
+       (let [state (.-state appender)
+             app   (:appender state)
+             rc    (ffi/duckdb_appender_flush app)]
+         (when-not (== (int rc) ffi/DuckDBSuccess)
+           (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_appender_error app))]
+             (swap! resource assoc :owner nil :cleanup #(destroy-appender-state! state))
+             (try (close-resource! (conn-state conn) resource) (catch Throwable _))
+             (throw (Exception. (str "Appender flush failed: " err)))))
+         :ok)))))
 
 ;; ---------------------------------------------------------------------------
 ;; 7b. Read-path instrumentation (dev-only, off by default; zero overhead off)
@@ -1717,78 +1855,45 @@
   (when-let [item (.get s)]
     (cons item (lazy-seq (supplier-seq s)))))
 
-(deftype ^:private ResultChunks [sql result-seg destroy-result* realize-chunk reduce-type
+(deftype ^:private ResultChunks [^Conn conn resource sql result-seg realize-chunk reduce-type
                                  ^java.util.ArrayList retained-chunks]
   AutoCloseable
-  (close [_]
-    ;; Destroy any chunks that were retained for the result's lifetime
-    ;; (`:zero-copy-retain` mode — used by `:single` so the multi-chunk
-    ;; concat / parallel-memcpy fast-path can keep referencing native
-    ;; chunk memory through materialization). Done before
-    ;; `duckdb_destroy_result` so the chunks unwind in reverse-creation
-    ;; order, matching DuckDB's expectations.
-    (when retained-chunks
-      (let [n (.size retained-chunks)]
-        (dotimes [i n]
-          (try
-            (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk
-                              ^MemorySegment (.get retained-chunks i))
-            (catch Throwable _)))
-        (.clear retained-chunks)))
-    @destroy-result*)
+  (close [_] (release-resource! conn resource))
   Supplier
   (get [_]
-    (let [^MemorySegment chunk (ffi/duckdb_fetch_chunk result-seg)]
-      (when (and chunk (not= 0 (.address chunk)))
-        (let [ds (realize-chunk chunk true)]
-          (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
-          ds))))
+    (call-with-resource
+     conn resource
+     (fn []
+       (let [^MemorySegment chunk (ffi/duckdb_fetch_chunk result-seg)]
+         (when (and chunk (not= 0 (.address chunk)))
+           (try (realize-chunk chunk true)
+                (finally (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk))))))))
   ITypedReduce
   (reduce [_ rfn acc]
-    (loop [acc acc]
-      (let [^MemorySegment chunk (instr-time :fetch-ns (ffi/duckdb_fetch_chunk result-seg))]
-        (if (and chunk (not= 0 (.address chunk)) (not (reduced? acc)))
-          (do
-            (instr-inc! :chunks)
-            (let [result
+    (call-with-resource
+     conn resource
+     (fn []
+       (loop [acc acc]
+         (if (reduced? acc)
+           @acc
+           (let [^MemorySegment chunk (instr-time :fetch-ns (ffi/duckdb_fetch_chunk result-seg))]
+             (if (and chunk (not= 0 (.address chunk)))
+               (do
+                 (instr-inc! :chunks)
+                 (recur
                   (case reduce-type
                     :clone
-                    ;; Realize+clone copies all column data into JVM heap
-                    ;; before we destroy the chunk; safe to free immediately.
-                    (let [ds (realize-chunk chunk true)]
-                      (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)
+                    (let [ds (try (realize-chunk chunk true)
+                                  (finally (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)))]
                       (rfn acc ds))
-
                     :zero-copy
-                    ;; Hand a native-backed dataset to `rfn`, then free the
-                    ;; chunk as soon as `rfn` returns. Callers MUST NOT
-                    ;; retain the dataset across iterations — clone it
-                    ;; inside the reducer if you need to keep it. The
-                    ;; try/finally guards against rfn throwing.
-                    (try
-                      (rfn acc (realize-chunk chunk false))
-                      (finally
-                        (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)))
-
+                    ;; Borrowed chunk memory remains valid through the reducer callback.
+                    (try (rfn acc (realize-chunk chunk false))
+                         (finally (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk)))
                     :zero-copy-retain
-                    ;; Native-backed dataset, chunk retained until the
-                    ;; result is closed. Internal: lets `:single` mode run
-                    ;; `datasets->dataset`'s fast-path numeric concat (which
-                    ;; needs all chunks alive simultaneously) without the
-                    ;; old per-chunk leak. The chunk is added to the
-                    ;; retain list BEFORE `realize-chunk`/`rfn` run, so
-                    ;; even if they throw the chunk will be reclaimed at
-                    ;; close-time.
-                    (do
-                      (.add retained-chunks chunk)
-                      (rfn acc (realize-chunk chunk false))))]
-              (recur result)))
-          (do
-            ;; Sentinel chunk on stream end is still a valid handle DuckDB
-            ;; expects us to free.
-            (when (and chunk (not= 0 (.address chunk)))
-              (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk))
-            (if (reduced? acc) @acc acc))))))
+                    (do (.add retained-chunks chunk)
+                        (rfn acc (realize-chunk chunk false))))))
+               acc)))))))
   Iterable
   (iterator [this] (clojure.lang.SeqIterator. (.seq this)))
   Seqable
@@ -1867,8 +1972,20 @@
       ;; Default: just the type ID
       base)))
 
+(defn- await-workers! [workers]
+  (let [interrupted? (volatile! false)]
+    (try
+      (doseq [^java.util.concurrent.Future worker workers]
+        (loop []
+          (when (try (.get worker) false
+                     (catch InterruptedException _ (vreset! interrupted? true) true)
+                     (catch java.util.concurrent.ExecutionException _ false))
+            (recur))))
+      (finally
+        (when @interrupted? (.interrupt (Thread/currentThread)))))))
+
 (defn- results->datasets
-  ^AutoCloseable [sql result-seg destroy-result* options]
+  ^AutoCloseable [conn sql result-seg destroy-result* options]
   (let [n-cols          (ffi/duckdb_column_count result-seg)
         names           (mapv (fn [i] (ffi/read-c-str ^MemorySegment (ffi/duckdb_column_name result-seg (long i)))) (range n-cols))
         type-infos      (mapv (fn [i]
@@ -1879,44 +1996,58 @@
                               (range n-cols))
         key-fn          (get options :key-fn identity)
         realize-chunk   (fn [^MemorySegment data-chunk clone?]
-                          (instr-time :realize-wallclock-ns
-                            (let [n-rows   (ffi/duckdb_data_chunk_get_size data-chunk)
-                                  colmap   (hamf/mut-map)
-                                  ;; Build delays that construct the Column. Each future runs
-                                  ;; clone eagerly in the agent pool, so cloning across columns
-                                  ;; overlaps. Forcing them via mapv deref awaits all in parallel.
-                                  columns
-                                  (hamf/mapv
-                                   (fn [cidx]
-                                     (instr-inc! :columns)
-                                     (let [^MemorySegment vdata    (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
-                                           ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
-                                           ^MemorySegment val-ptr  (ffi/duckdb_vector_get_validity vdata)
-                                           missing                 (instr-time :validity-ns
-                                                                     (validity->missing n-rows val-ptr))
-                                           coldata                 (instr-time :buffer-ns
-                                                                     (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata))
-                                           cname                   (key-fn (names cidx))
-                                           delayed-data            (if clone?
-                                                                     (do (instr-inc! :clones)
-                                                                         (future (instr-time :clone-cpu-ns
-                                                                                   (dt/clone coldata))))
-                                                                     (delay coldata))]
-                                       (.put colmap cname cidx)
-                                       (delay (Column. missing @delayed-data {:name cname} nil))))
-                                   (hamf/range n-cols))
-                                  col-data (instr-time :deref-wait-ns
-                                             (hamf/mapv deref columns))]
-                              (Dataset. col-data
-                                        (persistent! colmap)
-                                        {:name :_unnamed}
-                                        0 0))))
+                          (let [workers (java.util.ArrayList.)]
+                            (try
+                              (instr-time :realize-wallclock-ns
+                                (let [n-rows   (ffi/duckdb_data_chunk_get_size data-chunk)
+                                      colmap   (hamf/mut-map)
+                                      ;; Build delays that construct the Column. Each future runs
+                                      ;; clone eagerly in the agent pool, so cloning across columns
+                                      ;; overlaps. Forcing them via mapv deref awaits all in parallel.
+                                      columns
+                                      (hamf/mapv
+                                       (fn [cidx]
+                                         (instr-inc! :columns)
+                                         (let [^MemorySegment vdata    (ffi/duckdb_data_chunk_get_vector data-chunk (long cidx))
+                                               ^MemorySegment data-ptr (ffi/duckdb_vector_get_data vdata)
+                                               ^MemorySegment val-ptr  (ffi/duckdb_vector_get_validity vdata)
+                                               missing                 (instr-time :validity-ns
+                                                                         (validity->missing n-rows val-ptr))
+                                               coldata                 (instr-time :buffer-ns
+                                                                         (coldata->buffer missing n-rows (type-infos cidx) (.address data-ptr) vdata))
+                                               cname                   (key-fn (names cidx))
+                                               delayed-data            (if clone?
+                                                                         (do (instr-inc! :clones)
+                                                                             (let [worker (future (instr-time :clone-cpu-ns
+                                                                                                    (dt/clone coldata)))]
+                                                                               (.add workers worker)
+                                                                               worker))
+                                                                         (delay coldata))]
+                                           (.put colmap cname cidx)
+                                           (delay (Column. missing @delayed-data {:name cname} nil))))
+                                       (hamf/range n-cols))
+                                      col-data (instr-time :deref-wait-ns
+                                                 (hamf/mapv deref columns))]
+                                  (Dataset. col-data
+                                            (persistent! colmap)
+                                            {:name :_unnamed}
+                                            0 0)))
+                              (finally (await-workers! workers)))))
         reduce-type     (get options :reduce-type :clone)
         ;; Allocate the retain list only when needed — keeps the common
         ;; `:clone` / `:zero-copy` paths allocation-free.
         retained-chunks (when (= reduce-type :zero-copy-retain)
-                          (java.util.ArrayList.))]
-    (ResultChunks. sql result-seg destroy-result* realize-chunk reduce-type retained-chunks)))
+                          (java.util.ArrayList.))
+        resource        (register-resource!
+                         conn "Result"
+                         #(let [failure (volatile! nil)]
+                            (doseq [chunk retained-chunks]
+                              (attempt-cleanup! failure
+                                                (fn [] (ffi/destroy-ptr! ffi/duckdb_destroy_data_chunk chunk))))
+                            (when retained-chunks (.clear retained-chunks))
+                            (attempt-cleanup! failure (fn [] @destroy-result*))
+                            (when-let [error @failure] (throw error))))]
+    (ResultChunks. conn resource sql result-seg realize-chunk reduce-type retained-chunks)))
 
 ;; ---------------------------------------------------------------------------
 ;; 11. datasets->dataset
@@ -2125,19 +2256,15 @@
                                                               (quot (.getNano ^Instant v) 1000))))
     :else (throw (RuntimeException. (str "Cannot bind value: " v)))))
 
-(deftype ^:private PrepStatement0 [sql destroy-prep* finalize-stmt]
+(deftype ^:private PrepStatement0 [sql conn resource execute]
   Object (toString [_] (str "#prepared-stmt-0[\"" sql "\"]"))
-  IFnDef (invoke [_] (finalize-stmt))
-  AutoCloseable (close [_] @destroy-prep*))
+  IFnDef (invoke [_] (execute []))
+  AutoCloseable (close [_] (release-resource! conn resource)))
 
-(deftype ^:private PrepStatement1 [sql ^MemorySegment stmt param-types destroy-prep* finalize-stmt]
+(deftype ^:private PrepStatement1 [sql conn resource execute]
   Object (toString [_] (str "#prepared-stmt-1[\"" sql "\"]"))
-  IFnDef
-  (invoke [_ v0]
-    (with-open [a (Arena/ofConfined)]
-      (bind-prepare-param stmt 1 v0 a)
-      (finalize-stmt)))
-  AutoCloseable (close [_] @destroy-prep*))
+  IFnDef (invoke [_ v0] (execute [v0]))
+  AutoCloseable (close [_] (release-resource! conn resource)))
 
 (declare prepare)
 
@@ -2152,75 +2279,70 @@
    (sql->datasets conn sql (assoc options :result-type :single)))
   ([conn sql] (sql->dataset conn sql nil)))
 
+(defn- execute-statement [conn sql stmt options]
+  (let [arena           (Arena/ofShared)
+        result-seg      (.allocate arena (.byteSize ^MemoryLayout ffi/result-layout))
+        destroy-result* (delay (try (ffi/duckdb_destroy_result result-seg)
+                                    (finally (.close arena))))
+        result-type     (get options :result-type :streaming)]
+    (try
+      (with-open [pending-arena (Arena/ofConfined)]
+        (let [pending-ptr (.allocate pending-arena ffi/VL-ADDR)
+              prc         (ffi/duckdb_pending_prepared stmt pending-ptr)
+              pending     (.get pending-ptr ffi/VL-ADDR 0)]
+          (try
+            (when-not (== (int prc) ffi/DuckDBSuccess)
+              (throw (RuntimeException.
+                      (str "Pending error: " (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))))))
+            (let [erc (ffi/duckdb_execute_pending pending result-seg)]
+              (when-not (== (int erc) ffi/DuckDBSuccess)
+                (throw (RuntimeException.
+                        (str "Execute error: " (ffi/read-c-str ^MemorySegment (ffi/duckdb_result_error result-seg)))))))
+            (finally (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)))))
+      (let [opts     (if (= result-type :single)
+                       (assoc options :reduce-type :zero-copy-retain)
+                       options)
+            res-data (results->datasets conn sql result-seg destroy-result* opts)]
+        (case result-type
+          (:streaming :realized) res-data
+          :single (with-open [res-data res-data]
+                    (datasets->dataset res-data options))))
+      (catch Throwable t
+        (try @destroy-result* (catch Throwable cleanup (.addSuppressed t cleanup)))
+        (throw t)))))
+
 (defn prepare
   (^AutoCloseable [^Conn conn ^String sql] (prepare conn sql nil))
   (^AutoCloseable [^Conn conn ^String sql options]
-   (let [arena               (Arena/ofConfined)
-         conn-seg            (MemorySegment/ofAddress (-conn-ptr conn))
-         stmt-ptr            (.allocate arena ffi/VL-ADDR)
-         rc                  (ffi/duckdb_prepare conn-seg (ffi/alloc-c-str arena sql) stmt-ptr)
-         ^MemorySegment stmt (.get stmt-ptr ffi/VL-ADDR 0)
-         destroy-prep*       (delay
-                               (ffi/destroy-ptr! ffi/duckdb_destroy_prepare stmt)
-                               (.close arena))
-         _                   (when-not (== rc 0)
-                               (let [err (ffi/read-c-str ^MemorySegment (ffi/duckdb_prepare_error stmt))]
-                                 @destroy-prep*
-                                 (throw (RuntimeException. (str "Error preparing: " err)))))
-         result-type         (get options :result-type :streaming)
-         finalize-stmt
-         (fn []
-           (let [pend-arena (Arena/ofConfined)]
-             (try
-               (let [pending-ptr            (.allocate pend-arena ffi/VL-ADDR)
-                     prc                    (ffi/duckdb_pending_prepared stmt pending-ptr)
-                     ^MemorySegment pending (.get pending-ptr ffi/VL-ADDR 0)
-                     _                      (when-not (== prc 0)
-                                              (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
-                                                            "Unknown Error")]
-                                                (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                                                (throw (RuntimeException. (str "Pending error: " err)))))
-                     result-seg             (.allocate pend-arena (.byteSize ^MemoryLayout ffi/result-layout))
-                     erc                    (ffi/duckdb_execute_pending pending result-seg)
-                     _                      (when-not (== erc 0)
-                                              (let [err (or (ffi/read-c-str ^MemorySegment (ffi/duckdb_pending_error pending))
-                                                            "Unknown Error")]
-                                                (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                                                (ffi/duckdb_destroy_result result-seg)
-                                                (throw (RuntimeException. (str "Execute error: " err)))))
-                     _                      (ffi/destroy-ptr! ffi/duckdb_destroy_pending pending)
-                     destroy-result*        (delay (ffi/duckdb_destroy_result result-seg)
-                                                   (.close pend-arena))
-                     opts                   (if (= result-type :single)
-                                              ;; `:single` materializes inside
-                                              ;; `datasets->dataset` (parallel-memcpy fast
-                                              ;; path needs every chunk alive at once); use
-                                              ;; the retain mode so chunks live until the
-                                              ;; ResultChunks closes, instead of leaking.
-                                              (assoc options :reduce-type :zero-copy-retain)
-                                              options)
-                     res-data               (results->datasets sql result-seg destroy-result* opts)]
-                 (case result-type
-                   :streaming res-data
-                   :realized res-data
-                   :single (with-open [^AutoCloseable res-data res-data]
-                             (datasets->dataset res-data options))))
-               (catch Exception e
-                 (try (.close pend-arena) (catch IllegalStateException _))
-                 (throw e)))))
-         n-params            (ffi/duckdb_nparams stmt)
-         param-types         (mapv #(ffi/duckdb_param_type stmt (long (inc %))) (range n-params))]
-     (case (int n-params)
-       0 (PrepStatement0. sql destroy-prep* finalize-stmt)
-       1 (PrepStatement1. sql stmt param-types destroy-prep* finalize-stmt)
-       ;; For 2+ params, use a general N-arity version
-       (reify
-         Object (toString [_] (str "#prepared-stmt-" n-params "[\"" sql "\"]"))
-         IFnDef
-         (applyTo [_ args]
-           (with-open [a (Arena/ofConfined)]
-             (doall (map-indexed (fn [i v]
-                                   (bind-prepare-param stmt (long (inc i)) v a))
-                                 args))
-             (finalize-stmt)))
-         AutoCloseable (close [_] @destroy-prep*))))))
+   (with-conn conn
+     (when-not (#{:streaming :realized :single} (get options :result-type :streaming))
+       (throw (IllegalArgumentException. "Invalid result type")))
+     (with-open [arena (Arena/ofConfined)]
+       (let [stmt-ptr      (.allocate arena ffi/VL-ADDR)
+             rc            (ffi/duckdb_prepare (MemorySegment/ofAddress (-conn-ptr conn))
+                                               (ffi/alloc-c-str arena sql) stmt-ptr)
+             stmt          (.get stmt-ptr ffi/VL-ADDR 0)
+             destroy-prep* (delay (ffi/destroy-ptr! ffi/duckdb_destroy_prepare stmt))]
+         (try
+           (when-not (== (int rc) ffi/DuckDBSuccess)
+             (throw (RuntimeException.
+                     (str "Error preparing: " (ffi/read-c-str ^MemorySegment (ffi/duckdb_prepare_error stmt))))))
+           (let [n-params (ffi/duckdb_nparams stmt)
+                 resource (register-resource! conn "Prepared statement" #(deref destroy-prep*))
+                 execute  (fn [args]
+                            (call-with-resource
+                             conn resource
+                             #(with-open [a (Arena/ofConfined)]
+                                (doseq [[i v] (map-indexed vector args)]
+                                  (bind-prepare-param stmt (long (inc i)) v a))
+                                (execute-statement conn sql stmt options))))]
+             (case (int n-params)
+               0 (PrepStatement0. sql conn resource execute)
+               1 (PrepStatement1. sql conn resource execute)
+               (reify
+                 Object (toString [_] (str "#prepared-stmt-" n-params "[\"" sql "\"]"))
+                 IFnDef (applyTo [_ args] (execute args))
+                 AutoCloseable (close [_] (release-resource! conn resource)))))
+           (catch Throwable t
+             (try @destroy-prep* (catch Throwable cleanup (.addSuppressed t cleanup)))
+             (throw t))))))))
